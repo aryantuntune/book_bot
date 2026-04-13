@@ -40,20 +40,32 @@ def gateway_flag() -> bool:
 PROFILE_DIR_NAME = ".chrome-profile"
 
 
-def start_browser() -> tuple[Playwright, Browser | None, BrowserContext, Page]:
-    """Launch a visible Chromium against a persistent user-data dir so that
-    cookies, local storage, and service-worker caches survive across runs.
-    This lets the bot skip operator-phone/OTP re-entry when HPCL still
+def start_browser(
+    headless: bool = False,
+    use_system_chrome: bool = True,
+) -> tuple[Playwright, Browser | None, BrowserContext, Page]:
+    """Launch Chromium against a persistent user-data dir so that cookies,
+    local storage, and service-worker caches survive across runs. This
+    lets the bot skip operator-phone/OTP re-entry when HPCL still
     considers the session active from a previous launch.
 
-    Returns (pw, None, ctx, page). The Browser slot is None because
-    launch_persistent_context gives back a BrowserContext directly — there
-    is no separate Browser handle to close. Callers must close ctx and
-    stop pw at shutdown.
+    headless: when True, Chrome runs without a visible window. The
+        persistent profile still works — cookies from previous headed
+        runs are reused. Suitable for scripted / background execution
+        via --headless.
 
-    Profile dir lives at config.ROOT / .chrome-profile, so it ends up next
-    to the .exe in frozen mode and at the repo root when running from
-    source. gitignored so we never commit cookies.
+    use_system_chrome: when True (default for the shareable .exe),
+        Playwright launches the operator's installed Google Chrome via
+        channel="chrome" instead of a bundled Chromium binary. This
+        drops ~345 MB from the PyInstaller bundle but requires Chrome
+        to be installed on the target machine.
+
+    Returns (pw, None, ctx, page). The Browser slot is None because
+    launch_persistent_context gives back a BrowserContext directly.
+    Callers must close ctx and stop pw at shutdown.
+
+    Profile dir lives at config.ROOT / .chrome-profile — next to the
+    .exe in frozen mode, at the repo root when running from source.
 
     Does NOT pre-reload. The reload-on-missing-chat logic lives in
     get_chat_frame — only reload once we've confirmed the chat hasn't
@@ -64,19 +76,26 @@ def start_browser() -> tuple[Playwright, Browser | None, BrowserContext, Page]:
     pw = sync_playwright().start()
     profile_dir = config.ROOT / PROFILE_DIR_NAME
     profile_dir.mkdir(parents=True, exist_ok=True)
-    ctx = pw.chromium.launch_persistent_context(
-        user_data_dir=str(profile_dir),
-        headless=False,
-        viewport={"width": 1366, "height": 850},
-        user_agent=(
+    launch_kwargs: dict = {
+        "user_data_dir": str(profile_dir),
+        "headless": headless,
+        "viewport": {"width": 1366, "height": 850},
+        "user_agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0 Safari/537.36"
         ),
-    )
+    }
+    if use_system_chrome:
+        launch_kwargs["channel"] = "chrome"
+    ctx = pw.chromium.launch_persistent_context(**launch_kwargs)
     # launch_persistent_context opens one blank tab by default — reuse it.
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
-    log.info(f"browser launched (persistent profile: {profile_dir.name})")
+    mode = "headless" if headless else "headed"
+    channel = "system-chrome" if use_system_chrome else "bundled-chromium"
+    log.info(
+        f"browser launched ({mode}, {channel}, profile={profile_dir.name})"
+    )
     log.info(f"navigating to {config.URL}")
     page.goto(config.URL, wait_until="domcontentloaded", timeout=60_000)
     page.wait_for_timeout(config.PAGE_LOAD_WAIT_S * 1000)

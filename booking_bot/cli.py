@@ -43,6 +43,7 @@ TERMINAL_ISSUE_PREFIXES = (
     "invalid_customer",
     "already_booked",
     "invalid_phone_format",
+    "not_registered",
 )
 
 
@@ -75,12 +76,23 @@ def normalize_phone(raw: object) -> tuple[str, str | None]:
 
 
 _USE_GUI_OTP = False
+_HEADLESS = False
 
 
 def _prompt_otp() -> str:
     """Blocking OTP prompt. Uses a tkinter popup when the startup dialog was
     shown (double-clicked .exe) and getpass() otherwise, so dev runs from a
-    terminal keep their current behavior."""
+    terminal keep their current behavior. In --headless mode there is no
+    UI, no stdin, and no way to receive an SMS-delivered OTP — so we fail
+    fast with a clear message instead of hanging."""
+    if _HEADLESS:
+        raise FatalError(
+            "headless mode can't prompt for OTP. HP Gas requires an "
+            "operator OTP the first time, so run the bot once without "
+            "--headless (double-click the .exe or pass no flags) to "
+            "establish the session, then subsequent --headless runs will "
+            "use the cached cookies in .chrome-profile/."
+        )
     if _USE_GUI_OTP:
         from booking_bot import ui
         return ui.prompt_otp(config.OPERATOR_PHONE)
@@ -103,9 +115,7 @@ def _resolve_playbook_path(explicit: Path | None, no_playbook: bool) -> Path | N
         if not explicit.exists():
             raise SystemExit(f"--playbook path does not exist: {explicit}")
         return explicit
-    # Bundled .exe: PyInstaller extracts recordings/ into _MEIPASS
-    # (RESOURCES_ROOT). From source: recordings/ lives at the repo root.
-    recordings_dir = config.RESOURCES_ROOT / "recordings"
+    recordings_dir = config.ROOT / "recordings"
     if not recordings_dir.exists():
         return None
     candidates = sorted(
@@ -249,7 +259,17 @@ def main() -> None:
             action="store_true",
             help="disable auto-playbook selection and run with hardcoded menu patterns.",
         )
+        ap.add_argument(
+            "--headless",
+            action="store_true",
+            help="run Chrome without a visible window (background mode). "
+            "Requires a previously-established session in .chrome-profile/ "
+            "so no OTP prompt is needed. Skips the startup GUI dialog and "
+            "does not allocate a console window.",
+        )
         args = ap.parse_args()
+        global _HEADLESS
+        _HEADLESS = args.headless
 
     log_path = setup_logging(debug=args.debug)
     log.info(f"booking_bot starting; log file: {log_path}")
@@ -284,9 +304,32 @@ def main() -> None:
             frame = _pre_frame
             log.info("re-using pre-launched browser from GUI bootstrap")
         else:
-            pw, browser_obj, ctx, page = browser.start_browser()
-            frame = browser.get_chat_frame(page)
-            chat.wait_until_settled(frame)
+            pw, browser_obj, ctx, page = browser.start_browser(headless=_HEADLESS)
+            # Initial frame acquisition + settle can fail when HPCL navigates
+            # the page mid-wait (observed: frame destroyed ~50s after load,
+            # likely a stale profile cookie triggering a redirect). Retry with
+            # a page reload — get_chat_frame re-acquires the frame, and the
+            # stale session gets replaced by a fresh one on reload.
+            startup_err: Exception | None = None
+            for startup_attempt in (1, 2, 3):
+                try:
+                    frame = browser.get_chat_frame(page)
+                    chat.wait_until_settled(frame)
+                    startup_err = None
+                    break
+                except RECOVERABLE as e:
+                    startup_err = e
+                    log.warning(
+                        f"startup frame settle attempt {startup_attempt} "
+                        f"failed: {type(e).__name__}: {e}"
+                    )
+                    try:
+                        page.reload(wait_until="domcontentloaded", timeout=60_000)
+                        page.wait_for_timeout(config.PAGE_LOAD_WAIT_S * 1000)
+                    except Exception as reload_e:
+                        log.warning(f"reload during startup retry failed: {reload_e}")
+            if startup_err is not None:
+                raise startup_err
         if pb is not None:
             # Playbook mode: do operator login if the session isn't already
             # active, then let the recording drive all menu navigation.
@@ -402,15 +445,21 @@ def main() -> None:
                         # bot failure, so skip the Issues workbook and write
                         # a human-readable label directly to col C.
                         store.mark_terminal(row_idx, "ekyc not done")
+                    elif result.reason == "not_registered":
+                        store.mark_terminal(row_idx, "not registered with HPCL")
+                    elif result.reason == "pending_payment":
+                        store.mark_terminal(row_idx, "payment pending")
                     else:
                         store.write_issue(row_idx, phone, result.reason, result.raw)
                         if not _is_terminal_issue(result.reason):
                             transient_rows.append(row_idx)
 
-                    # Post-row navigation. Success leaves us on the
-                    # customer-phone input (playbook) or we click a nav label
-                    # (legacy). Issue needs an explicit reset back to customer
-                    # entry.
+                    # Post-row navigation. Clean Success leaves us on the
+                    # customer-phone input (booking_body's tail is Previous
+                    # Menu → Book for Others). Issue and salvaged Success need
+                    # an explicit reset — the salvage path in playbook.py
+                    # handles its own reset before returning, so here we only
+                    # reset on non-Success.
                     if pb is not None:
                         if not isinstance(result, chat.Success):
                             try:
@@ -558,9 +607,12 @@ def main() -> None:
 
 def _recover_with_playbook(page, pb, operator_phone, get_otp):
     """Playbook-aware recovery: reload the page, re-acquire the chat frame,
-    login if the session dropped, then replay the full auth_prefix. Avoids
-    browser.recover_session's hardcoded state patterns (which defeat the
-    point of playbook mode).
+    login if the session dropped, then navigate to customer-phone entry via
+    reset_to_customer_entry. The reset helper handles both the normal path
+    (Main Menu → auth_prefix) and the alt path (Book With Other Mobile) —
+    the latter matters because HPCL's chat state persists across page
+    reloads via the operator session cookie, so a reload landing on the
+    "not registered" alt menu would dead-end on blind auth_prefix replay.
 
     Does NOT call wait_until_settled after the reload — login_if_needed
     polls detect_state directly, which is faster and doesn't block on a
@@ -571,7 +623,18 @@ def _recover_with_playbook(page, pb, operator_phone, get_otp):
     page.wait_for_timeout(config.PAGE_LOAD_WAIT_S * 1000)
     frame = browser.get_chat_frame(page)
     login_if_needed(frame, operator_phone, get_otp)
-    playbook_mod.replay_auth(frame, pb, operator_phone, get_otp)
+    try:
+        playbook_mod.reset_to_customer_entry(frame, pb)
+    except (OptionNotFoundError, ChatStuckError, GatewayError) as e:
+        # reset couldn't find a usable nav target — fall back to the legacy
+        # replay_auth path (blindly clicks Booking Services → Book for Others)
+        # so we still have a chance of landing on phone entry for sessions
+        # that came up fresh on the main menu.
+        log.warning(
+            f"reset after reload failed ({type(e).__name__}: {e}); "
+            f"falling back to replay_auth"
+        )
+        playbook_mod.replay_auth(frame, pb, operator_phone, get_otp)
     return frame
 
 
