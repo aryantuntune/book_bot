@@ -38,7 +38,7 @@ SEL_SCROLLER     = "#scroller"
 
 # ---- Success detection (strict; see spec §6.3) ----
 SUCCESS_RE = re.compile(
-    r"delivery\s+confirmation\s+code\s+is\s+(\d{6})",
+    r"delivery\s+confirmation\s+code\s+is\s+(\d{6})(?!\d)",
     re.IGNORECASE,
 )
 
