@@ -149,3 +149,19 @@ def test_write_issue_appends_multiple(store_env):
     iss = openpyxl.load_workbook(store_env / "Issues" / "file1.xlsx")
     assert iss.active.max_row == 2
     assert iss.active.cell(row=2, column=2).value == "9123456789"
+
+
+def test_summary_reports_counts(store_env):
+    inp = _make_input(store_env, [
+        ("C1", "9876543210"),
+        ("C2", "9123456789"),
+        ("C3", "9000000000"),
+        ("C4", "9111111111"),
+    ])
+    store = ExcelStore(inp)
+    store.write_success(1, "111111")
+    store.write_issue(2, "9123456789", "unexpected_state", "raw")
+    # rows 3, 4 still pending
+
+    s = store.summary()
+    assert s == {"total": 4, "success": 1, "issue": 1, "pending": 2}

@@ -47,8 +47,19 @@ class ExcelStore:
         self._issues_ws = None
 
     def _convert_xls_to_xlsx(self, xls_path: Path) -> Path:
-        """Implemented in Stage D."""
-        raise NotImplementedError("xls conversion added in Stage D")
+        """Read legacy .xls via xlrd and write out a .xlsx copy next to it."""
+        import xlrd                              # lazy import — heavy
+        book = xlrd.open_workbook(str(xls_path))
+        sheet = book.sheet_by_index(0)
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        for r in range(sheet.nrows):
+            for c in range(sheet.ncols):
+                ws.cell(row=r + 1, column=c + 1).value = sheet.cell_value(r, c)
+        new_path = xls_path.with_suffix(".xlsx")
+        wb.save(new_path)
+        log.info(f"converted {xls_path.name} -> {new_path.name}")
+        return new_path
 
     # ---- Resume iteration ----
 
@@ -117,3 +128,20 @@ class ExcelStore:
         else:
             self._issues_wb = openpyxl.Workbook()
         self._issues_ws = self._issues_wb.active
+
+    def summary(self) -> dict[str, int]:
+        """Count total / success / issue / pending rows by inspecting col C."""
+        total = success = issue = pending = 0
+        for row in self._ws.iter_rows(min_row=1, values_only=True):
+            phone = row[1] if len(row) > 1 else None
+            code  = row[2] if len(row) > 2 else None
+            if phone is None:
+                continue
+            total += 1
+            if code is None or str(code).strip() == "":
+                pending += 1
+            elif str(code).strip().upper() == "ISSUE":
+                issue += 1
+            else:
+                success += 1
+        return {"total": total, "success": success, "issue": issue, "pending": pending}
