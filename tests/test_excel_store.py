@@ -117,3 +117,35 @@ def test_write_success_updates_pending_iteration(store_env):
 
     store2 = ExcelStore(inp)
     assert [r[0] for r in store2.pending_rows()] == [2]
+
+
+def test_write_issue_marks_output_and_creates_issues(store_env):
+    inp = _make_input(store_env, [("C1", "9876543210")])
+    store = ExcelStore(inp)
+
+    store.write_issue(1, "9876543210", reason="unexpected_state",
+                      raw="bot said: please try later")
+
+    out = openpyxl.load_workbook(store_env / "Output" / "file1.xlsx")
+    assert out.active.cell(row=1, column=3).value == "ISSUE"
+
+    issues_path = store_env / "Issues" / "file1.xlsx"
+    assert issues_path.exists()
+    iss = openpyxl.load_workbook(issues_path)
+    row = [iss.active.cell(row=1, column=c).value for c in range(1, 5)]
+    assert row[0] == "C1"
+    assert row[1] == "9876543210"
+    assert "unexpected_state" in row[2]
+    assert "please try later" in row[2]
+    assert "row 1" in row[3]
+
+
+def test_write_issue_appends_multiple(store_env):
+    inp = _make_input(store_env, [("C1", "9876543210"), ("C2", "9123456789")])
+    store = ExcelStore(inp)
+    store.write_issue(1, "9876543210", reason="r1", raw="raw1")
+    store.write_issue(2, "9123456789", reason="r2", raw="raw2")
+
+    iss = openpyxl.load_workbook(store_env / "Issues" / "file1.xlsx")
+    assert iss.active.max_row == 2
+    assert iss.active.cell(row=2, column=2).value == "9123456789"

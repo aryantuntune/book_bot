@@ -81,3 +81,39 @@ class ExcelStore:
         tmp = path.with_suffix(path.suffix + ".tmp")
         wb.save(tmp)
         os.replace(tmp, path)
+
+    def write_issue(self, row_idx: int, phone: str, reason: str, raw: str) -> None:
+        """Mark col C = 'ISSUE' in Output; append a row to Issues (create the
+        workbook on first call). Issues columns:
+          A: consumer number (mirrored from Output col A)
+          B: phone (cleaned or raw cell, whatever the caller has)
+          C: reason + raw chatbot text (joined with ' | ')
+          D: cross-reference to Output row ('row N in Output/<file>')
+        """
+        self._ws.cell(row=row_idx, column=3).value = "ISSUE"
+        self._atomic_save(self._wb, self.output_path)
+
+        self._ensure_issues_workbook()
+        consumer_no = self._ws.cell(row=row_idx, column=1).value
+        # Find the next empty row in the Issues worksheet.
+        next_row = 1
+        while self._issues_ws.cell(row=next_row, column=1).value is not None:
+            next_row += 1
+        self._issues_ws.cell(row=next_row, column=1).value = consumer_no
+        self._issues_ws.cell(row=next_row, column=2).value = phone
+        self._issues_ws.cell(row=next_row, column=3).value = f"{reason} | {raw}"
+        self._issues_ws.cell(row=next_row, column=4).value = (
+            f"row {row_idx} in Output/{self.output_path.name}"
+        )
+        self._atomic_save(self._issues_wb, self.issues_path)
+        log.warning(f"row {row_idx}: ISSUE ({reason})")
+
+    def _ensure_issues_workbook(self) -> None:
+        """Lazily create or open the Issues workbook."""
+        if self._issues_wb is not None:
+            return
+        if self.issues_path.exists():
+            self._issues_wb = openpyxl.load_workbook(self.issues_path)
+        else:
+            self._issues_wb = openpyxl.Workbook()
+        self._issues_ws = self._issues_wb.active
