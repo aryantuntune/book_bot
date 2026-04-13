@@ -286,3 +286,52 @@ def dump_visible_state(frame: Frame) -> str:
         )
     except Exception as e:
         return f"<dump_visible_state failed: {e}>"
+
+
+# ---- Task 17: book_one state machine ----
+
+def book_one(frame: Frame, phone: str) -> BookingResult:
+    """Drive one booking from READY_FOR_CUSTOMER to terminal state.
+
+    Flow:
+      1. Type the customer phone, submit.
+      2. wait_until_settled → new message(s).
+      3. If the new text contains a SUCCESS_RE match, return Success.
+      4. Otherwise try clicking an affirmative option (Yes / Continue / ...).
+         - If an affirmative matches, loop back to step 2 with the fresh
+           settled snapshot. Accumulate the full bot response chain in
+           `accumulated` for the Issue diagnostic field.
+         - If no affirmative matches, the bot is in an unexpected state —
+           return Issue('unexpected_state', accumulated).
+      5. Bail out after MAX_STEPS_PER_BOOKING iterations with
+         Issue('too_many_steps', accumulated).
+
+    All recoverable exceptions (GatewayError, ChatStuckError, IframeLostError,
+    OptionNotFoundError from wait_until_settled or earlier) propagate to the
+    cli.py retry loop — book_one does not catch them. The ONE exception is
+    OptionNotFoundError from our own click_option(AFFIRMATIVE_LABELS) call:
+    that just means 'the chat isn't in an affirmative state', which is an
+    unexpected_state Issue, not a recoverable error.
+    """
+    send_text(frame, phone)
+    new = wait_until_settled(frame)
+    accumulated = new.text
+
+    for step in range(config.MAX_STEPS_PER_BOOKING):
+        m = config.SUCCESS_RE.search(new.text)
+        if m:
+            log.info(f"book_one success: code={m.group(1)} (step {step})")
+            return Success(code=m.group(1), raw=accumulated)
+
+        try:
+            label = click_option(frame, config.AFFIRMATIVE_LABELS)
+        except OptionNotFoundError:
+            log.info(f"book_one unexpected_state at step {step}")
+            return Issue(reason="unexpected_state", raw=accumulated)
+
+        log.debug(f"book_one clicked affirmative: {label!r}")
+        new = wait_until_settled(frame)
+        accumulated += "\n---\n" + new.text
+
+    log.info("book_one too_many_steps")
+    return Issue(reason="too_many_steps", raw=accumulated)
