@@ -53,6 +53,7 @@ def start_browser() -> tuple[Playwright, Browser, BrowserContext, Page]:
     log.info(f"browser launched; navigating to {config.URL}")
     page.goto(config.URL, wait_until="domcontentloaded", timeout=60_000)
     page.wait_for_timeout(config.PAGE_LOAD_WAIT_S * 1000)
+    install_gateway_listener(page)
     return pw, browser, ctx, page
 
 
@@ -84,3 +85,35 @@ def get_chat_frame(page: Page) -> Frame:
     raise IframeLostError(
         f"could not attach inner chat frame within {config.GET_FRAME_TIMEOUT_S}s: {last_err}"
     )
+
+
+def install_gateway_listener(page: Page) -> None:
+    """Install page.on('response') and page.on('framenavigated') listeners that
+    flip _gateway_error_seen True when:
+      - any response from the hpchatbot.hpcl.co.in domain has status in
+        GATEWAY_STATUS_CODES
+      - any frame navigates to a URL whose path matches GATEWAY_URL_RE
+
+    The flag is read AND reset by chat.wait_until_settled on every call."""
+
+    def _on_response(response):
+        global _gateway_error_seen
+        try:
+            url = response.url
+            if "hpchatbot.hpcl.co.in" in url and response.status in config.GATEWAY_STATUS_CODES:
+                log.warning(f"gateway error response: {response.status} {url}")
+                _gateway_error_seen = True
+        except Exception:
+            pass  # ignore listener-thread errors
+
+    def _on_framenav(frame):
+        global _gateway_error_seen
+        try:
+            if config.GATEWAY_URL_RE.search(frame.url or ""):
+                log.warning(f"frame navigated to gateway-ish url: {frame.url}")
+                _gateway_error_seen = True
+        except Exception:
+            pass
+
+    page.on("response", _on_response)
+    page.on("framenavigated", _on_framenav)
