@@ -1,0 +1,116 @@
+{
+  "title": "Twixor- HPCL",
+  "inputCount": 2,
+  "inputs": [
+    {
+      "tag": "textarea",
+      "type": null,
+      "id": null,
+      "name": null,
+      "placeholder": "Type your message here",
+      "cls": "replybox",
+      "visible": true,
+      "disabled": false,
+      "readonly": false,
+      "x": 15,
+      "y": 717,
+      "w": 348,
+      "h": 35,
+      "value": ""
+    },
+    {
+      "tag": "input",
+      "type": "text",
+      "id": "mobile",
+      "name": "mobile",
+      "placeholder": "e.g\u00a0\u00a0XXXXXXXXXX",
+      "cls": "span12",
+      "visible": true,
+      "disabled": false,
+      "readonly": false,
+      "x": 20,
+      "y": 582,
+      "w": 324,
+      "h": 32,
+      "value": ""
+    }
+  ],
+  "buttonCount": 6,
+  "buttons": [
+    {
+      "tag": "button",
+      "text": "Close",
+      "id": "close_qrscanner",
+      "cls": null,
+      "type": null,
+      "visible": false,
+      "x": 0,
+      "y": 0,
+      "w": 0,
+      "h": 0
+    },
+    {
+      "tag": "button",
+      "text": "",
+      "id": null,
+      "cls": "mic_btn_record pull-left",
+      "type": null,
+      "visible": false,
+      "x": 0,
+      "y": 0,
+      "w": 0,
+      "h": 0
+    },
+    {
+      "tag": "button",
+      "text": "",
+      "id": null,
+      "cls": "reply-submit pull-right",
+      "type": null,
+      "visible": true,
+      "x": 373,
+      "y": 715,
+      "w": 35,
+      "h": 35
+    },
+    {
+      "tag": "button",
+      "text": "Submit",
+      "id": null,
+      "cls": "btn btn-small btn-success submit",
+      "type": "button",
+      "visible": true,
+      "x": 137,
+      "y": 624,
+      "w": 79,
+      "h": 28
+    },
+    {
+      "tag": "button",
+      "text": "Mobiile",
+      "id": "6451efbd8538361cc4d5ae2c",
+      "cls": "btn-small dynamic-message-button  type-6",
+      "type": null,
+      "visible": false,
+      "x": 0,
+      "y": 0,
+      "w": 0,
+      "h": 0
+    },
+    {
+      "tag": "button",
+      "text": "Open App",
+      "id": "openPopup",
+      "cls": "btn btn-large btn-primary",
+      "type": null,
+      "visible": false,
+      "x": 0,
+      "y": 0,
+      "w": 0,
+      "h": 0
+    }
+  ],
+  "liCount": 0,
+  "lastLi": null,
+  "formsInChat": []
+}

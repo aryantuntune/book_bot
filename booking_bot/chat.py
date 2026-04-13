@@ -96,10 +96,62 @@ def _loader_visible(frame: Frame) -> bool:
 # ---- Public primitives ----
 
 def send_text(frame: Frame, text: str) -> None:
-    """Focus textarea.replybox, clear existing content, type the text, click
-    submit. The clear step is essential — leftover content from a prior
+    """Type `text` and submit it to the chatbot.
+
+    Priority order:
+      1. Inline form input — when the chatbot asks for structured input
+         (mobile number, OTP, etc.) it renders a dedicated
+         `<input type='text'>` inside the chat bubble, paired with a
+         `button.submit`. We must type into THAT input, not the generic
+         bottom textarea; otherwise the chatbot replies with its "I am
+         still learning" fallback. Selector: any visible non-.replybox
+         input whose type is text/number/tel/password.
+      2. Fallback: the bottom `textarea.replybox` + `button.reply-submit`
+         for free-text interactions with no inline form visible.
+
+    The clear step is essential — leftover content from a prior
     interaction would otherwise be concatenated."""
     try:
+        inline = frame.evaluate(
+            """
+            () => {
+              const candidates = document.querySelectorAll(
+                "input[type='text'], input[type='number'], "
+                + "input[type='tel'], input[type='password']"
+              );
+              for (const el of candidates) {
+                if (el.offsetParent === null) continue;
+                if (el.disabled || el.readOnly) continue;
+                const cls = el.getAttribute('class') || '';
+                if (cls.includes('replybox')) continue;
+                return {
+                  id: el.id || null,
+                  name: el.getAttribute('name'),
+                  placeholder: el.getAttribute('placeholder'),
+                };
+              }
+              return null;
+            }
+            """
+        )
+
+        if inline is not None:
+            sel = _build_inline_selector(inline)
+            frame.evaluate(
+                f"() => {{ const el = document.querySelector({sel!r}); "
+                f"if (el) {{ el.value = ''; el.focus(); }} }}"
+            )
+            frame.fill(sel, text)
+            try:
+                frame.click("button.submit", timeout=3_000)
+            except PWTimeoutError:
+                frame.press(sel, "Enter")
+            log.debug(
+                f"send_text(inline {inline.get('id') or inline.get('name')!r}): {text!r}"
+            )
+            return
+
+        # Fallback: bottom textarea.replybox
         frame.focus(config.SEL_TEXTAREA)
         frame.evaluate(
             f"() => {{ const t = document.querySelector('{config.SEL_TEXTAREA}'); "
@@ -107,9 +159,20 @@ def send_text(frame: Frame, text: str) -> None:
         )
         frame.fill(config.SEL_TEXTAREA, text)
         frame.click(config.SEL_SUBMIT)
-        log.debug(f"sent text: {text!r}")
+        log.debug(f"send_text(replybox): {text!r}")
     except PWTimeoutError as e:
         raise IframeLostError(f"send_text timeout: {e}") from e
+
+
+def _build_inline_selector(info: dict) -> str:
+    """Build a CSS selector for the inline input we found in `send_text`.
+    Prefers `#id`, falls back to `[name='...']`, then a structural selector
+    of last resort."""
+    if info.get("id"):
+        return f"input#{info['id']}"
+    if info.get("name"):
+        return f"input[name='{info['name']}']"
+    return "input[type='text']:not(.replybox)"
 
 
 def click_option(frame: Frame, label_patterns: Iterable[re.Pattern[str]]) -> str:
