@@ -507,17 +507,22 @@ def _classify_failure(
     enabled = snap.get("enabled") or []
     text = snap.get("text") or ""
     new_text = _post_baseline_text(text, baseline)
-    # Prefer the per-row slice for text classification so we don't trigger
-    # on an earlier row's error bubble still sitting in the scroller.
+    # For STATE keyword checks (eKYC / payment / invalid / already) we accept
+    # a fallback to the last-1500-chars tail, because those patterns are
+    # qualitative state markers, not codes. Misclassifying a payment page
+    # just means we won't retry a terminal row — not a data-integrity issue.
     text_for_search = new_text or text
 
-    # Success takes precedence over every failure reason. HPCL's post-booking
-    # "manage your booking" menu shows a Make Payment button for the *just-
-    # booked* invoice — without this check the payment classifier hijacks
-    # rows that actually succeeded.
-    success_m = config.SUCCESS_RE.search(text_for_search)
-    if success_m:
-        return chat.Success(code=success_m.group(1), raw=text_for_search[-500:])
+    # Success detection, however, MUST use the safe baseline-relative salvage
+    # helper — falling back to `text` here would pull a prior row's 6-digit
+    # code out of the stale scroller tail and attribute it to THIS row.
+    # Observed: recheck_30_46 run at 23:07 leaked row 1's 719275 into row 2.
+    salvaged = _salvage_success_from_scroller(frame, baseline)
+    if salvaged is not None:
+        return chat.Success(
+            code=salvaged,
+            raw=f"classifier salvage (expected click {expected_click_text!r})",
+        )
 
     if _EKYC_TEXT_RE.search(text_for_search):
         return chat.Issue(
@@ -601,9 +606,14 @@ def _post_baseline_text(full: str, baseline: str) -> str:
     the full scroller on fallback is what caused the repeated false-positive
     bug (rows 10/11 inheriting row 9's confirmation code), so we refuse to
     guess.
+
+    EMPTY BASELINE is treated as UNSAFE. When chat.full_scroller_text fails
+    at the start of a row it returns ""; returning `full` here would let the
+    happy path match ANY prior row's 6-digit code and attribute it to this
+    row. We return "" so the caller falls through to an Issue instead.
     """
     if not baseline:
-        return full
+        return ""
     if full.startswith(baseline):
         return full[len(baseline):]
     tail = baseline[-500:] if len(baseline) > 500 else baseline
@@ -636,6 +646,11 @@ def _salvage_success_from_scroller(frame: Frame, baseline: str = "") -> str | No
 
     Returns the 6-digit code or None. Never raises.
     """
+    if not baseline:
+        # No reference point — we cannot distinguish a new code from a stale
+        # one. Refusing to guess is the only safe behaviour.
+        log.warning("_salvage_success_from_scroller called with empty baseline — refusing to claim a code")
+        return None
     try:
         full = chat.full_scroller_text(frame)
     except Exception as e:
@@ -645,7 +660,7 @@ def _salvage_success_from_scroller(frame: Frame, baseline: str = "") -> str | No
     m = config.SUCCESS_RE.search(new_text)
     if m:
         return m.group(1)
-    if baseline and new_text == "":
+    if new_text == "":
         baseline_codes = config.SUCCESS_RE.findall(baseline)
         full_codes = config.SUCCESS_RE.findall(full)
         if len(full_codes) > len(baseline_codes):
