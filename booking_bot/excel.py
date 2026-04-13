@@ -65,3 +65,19 @@ class ExcelStore:
             if col_c is not None and str(col_c).strip() != "":
                 continue
             yield (row_idx, col_b)
+
+    # ---- Writes ----
+
+    def write_success(self, row_idx: int, code: str) -> None:
+        """Write the 6-digit code to col C of row_idx, then atomically save."""
+        self._ws.cell(row=row_idx, column=3).value = code
+        self._atomic_save(self._wb, self.output_path)
+        log.info(f"row {row_idx}: success code={code}")
+
+    @staticmethod
+    def _atomic_save(wb: openpyxl.Workbook, path: Path) -> None:
+        """Save to <path>.tmp then os.replace — atomic on NTFS for same-FS
+        renames. Never leaves a half-written .xlsx."""
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        wb.save(tmp)
+        os.replace(tmp, path)

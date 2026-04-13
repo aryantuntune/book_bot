@@ -85,3 +85,35 @@ def test_pending_rows_skips_none_phone(store_env):
     ])
     store = ExcelStore(inp)
     assert [r[0] for r in store.pending_rows()] == [2]
+
+
+def test_write_success_writes_code(store_env):
+    inp = _make_input(store_env, [("C1", "9876543210"), ("C2", "9123456789")])
+    store = ExcelStore(inp)
+
+    store.write_success(1, "764260")
+
+    wb = openpyxl.load_workbook(store_env / "Output" / "file1.xlsx")
+    assert wb.active.cell(row=1, column=3).value == "764260"
+    assert wb.active.cell(row=2, column=3).value in (None, "")
+
+
+def test_write_success_is_atomic(store_env):
+    """After a successful write, the .tmp sibling must not exist."""
+    inp = _make_input(store_env, [("C1", "9876543210")])
+    store = ExcelStore(inp)
+    store.write_success(1, "111111")
+    tmp = store_env / "Output" / "file1.xlsx.tmp"
+    assert not tmp.exists()
+
+
+def test_write_success_updates_pending_iteration(store_env):
+    inp = _make_input(store_env, [
+        ("C1", "9876543210"),
+        ("C2", "9123456789"),
+    ])
+    store = ExcelStore(inp)
+    store.write_success(1, "222222")
+
+    store2 = ExcelStore(inp)
+    assert [r[0] for r in store2.pending_rows()] == [2]
