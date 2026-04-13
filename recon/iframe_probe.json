@@ -1,0 +1,79 @@
+{
+  "title": "Twixor- HPCL",
+  "bodyTextHead": "HPCL\n\nOffering you the flexibility and convenience of booking your refill cylinder at anytime, from anywhere \ud83d\udc68\ud83c\udffb\u200d\ud83c\udfeb, when you are on the move, on a holiday or at home through multiple modes\n\nPlease enter your 10-digit\u00a0Mobile number\n\nMobiile",
+  "chat": {
+    "found": true,
+    "childCount": 3,
+    "text": "Offering you the flexibility and convenience of booking your refill cylinder at anytime, from anywhere \ud83d\udc68\ud83c\udffb\u200d\ud83c\udfeb, when you are on the move, on a holiday or at home through multiple modes\n\nPlease enter your 10-digit\u00a0Mobile number\n\nMobiile"
+  },
+  "wrapper": {
+    "found": true,
+    "childCount": 1,
+    "text": "Offering you the flexibility and convenience of booking your refill cylinder at anytime, from anywhere \ud83d\udc68\ud83c\udffb\u200d\ud83c\udfeb, when you are on the move, on a holiday or at home through multiple modes\n\nPlease enter your 10-digit\u00a0Mobile number\n\nMobiile"
+  },
+  "scroller": {
+    "found": true,
+    "childCount": 7,
+    "text": "Offering you the flexibility and convenience of booking your refill cylinder at anytime, from anywhere \ud83d\udc68\ud83c\udffb\u200d\ud83c\udfeb, when you are on the move, on a holiday or at home through multiple modes\n\nPlease enter your 10-digit\u00a0Mobile number\n\nMobiile"
+  },
+  "loader": {
+    "found": true,
+    "childCount": 1,
+    "text": "\t\t\t\t\t\tLoad More\t\t\t\t\t"
+  },
+  "processBtn": {
+    "found": true,
+    "childCount": 1,
+    "text": "\t\t    \t\t\t\t\t\t\t\t\t    \t\t\t\t\t\t        \t\t\t\t\t\t        \t\t\t\t\t\t    \t\t\t\t\t\t    \t\t\t\t\t\t        \t\t\t\t\t\t        \t\t\t\t\t\t    \t\t\t\t\t\t    \t\t\t\t\t\t        \t\t\t\t\t\t        \t\t\t\t\t\t    \t\t\t\t\t\t\t\t    \t\t"
+  },
+  "inputs": [
+    {
+      "tag": "textarea",
+      "type": null,
+      "id": "",
+      "name": null,
+      "placeholder": "Type your message here",
+      "cls": "replybox",
+      "visible": true
+    }
+  ],
+  "buttons": [
+    {
+      "tag": "button",
+      "text": "Close",
+      "id": "close_qrscanner",
+      "cls": null,
+      "visible": false
+    },
+    {
+      "tag": "button",
+      "text": "",
+      "id": "",
+      "cls": "mic_btn_record pull-left",
+      "visible": false
+    },
+    {
+      "tag": "button",
+      "text": "",
+      "id": "",
+      "cls": "reply-submit pull-right",
+      "visible": true
+    },
+    {
+      "tag": "button",
+      "text": "Mobiile",
+      "id": "6451efbd8538361cc4d5ae2c",
+      "cls": "btn-small dynamic-message-button  type-6",
+      "visible": true
+    },
+    {
+      "tag": "button",
+      "text": "Open App",
+      "id": "openPopup",
+      "cls": "btn btn-large btn-primary",
+      "visible": false
+    }
+  ],
+  "li_count": 0,
+  "li_items": []
+}
