@@ -142,3 +142,78 @@ def click_option(frame: Frame, label_patterns: Iterable[re.Pattern[str]]) -> str
         f"no visible option matched {[p.pattern for p in label_patterns]}; "
         f"visible options were: {[b['text'] for b in buttons]}"
     )
+
+
+# ---- Task 14: wait_until_settled ----
+
+def wait_until_settled(frame: Frame, timeout: float | None = None) -> Snapshot:
+    """Wait until the chatbot has fully processed the last interaction, then
+    return a Snapshot whose .text contains ONLY the content added since entry.
+
+    Algorithm (see spec §6.1):
+      1. Reset the gateway-error flag (any flag raised now is from THIS call).
+      2. Capture a 'before' snapshot of #scroller.
+      3. Poll every 500ms:
+         - if gateway flag set → raise GatewayError
+         - if frame detached → raise IframeLostError
+         - compute 'now' snapshot
+      4. First-activity gate: require either (a) the loader has been seen
+         visible at least once, or (b) the scroller hash has changed at least
+         once. Without this, a caller that invokes us right after send_text()
+         could return with an empty diff if the bot hasn't started yet.
+      5. Settled = loader currently hidden AND scroller hash unchanged for
+         SETTLE_QUIET_MS (1500ms).
+      6. Timeout → ChatStuckError.
+    """
+    # Late import to avoid a cycle at module load (chat ← browser ← chat).
+    from booking_bot import browser
+
+    timeout_s = timeout if timeout is not None else config.STUCK_THRESHOLD_S
+    deadline = time.monotonic() + timeout_s
+    poll_ms = 500
+    quiet_target_ms = config.SETTLE_QUIET_MS
+
+    browser.reset_gateway_flag()
+    before = _scroller_snapshot(frame)
+
+    activity_seen = False
+    last_change_time: float | None = None
+    last_hash = before.hash
+
+    while time.monotonic() < deadline:
+        if browser.gateway_flag():
+            raise GatewayError("gateway flag set during wait_until_settled")
+
+        try:
+            now = _scroller_snapshot(frame)
+        except IframeLostError:
+            raise
+
+        loader = _loader_visible(frame)
+
+        if loader:
+            activity_seen = True
+
+        if now.hash != last_hash:
+            activity_seen = True
+            last_change_time = time.monotonic()
+            last_hash = now.hash
+
+        if activity_seen and not loader and last_change_time is not None:
+            quiet_ms = (time.monotonic() - last_change_time) * 1000
+            if quiet_ms >= quiet_target_ms:
+                # Settled. Return the diff.
+                new_text = now.text[len(before.text):] if \
+                    now.text.startswith(before.text) else now.text
+                return Snapshot(
+                    text=new_text,
+                    child_count=now.child_count,
+                    hash=now.hash,
+                )
+
+        time.sleep(poll_ms / 1000)
+
+    raise ChatStuckError(
+        f"wait_until_settled timeout after {timeout_s}s "
+        f"(activity_seen={activity_seen}, last_hash_changed_at={last_change_time})"
+    )
