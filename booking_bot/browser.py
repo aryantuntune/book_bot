@@ -37,18 +37,36 @@ def gateway_flag() -> bool:
     return _gateway_error_seen
 
 
-def start_browser() -> tuple[Playwright, Browser, BrowserContext, Page]:
-    """Launch a visible Chromium, return (pw, browser, ctx, page). Caller owns
-    the handles and must call browser.close() / pw.stop() at shutdown.
+PROFILE_DIR_NAME = ".chrome-profile"
+
+
+def start_browser() -> tuple[Playwright, Browser | None, BrowserContext, Page]:
+    """Launch a visible Chromium against a persistent user-data dir so that
+    cookies, local storage, and service-worker caches survive across runs.
+    This lets the bot skip operator-phone/OTP re-entry when HPCL still
+    considers the session active from a previous launch.
+
+    Returns (pw, None, ctx, page). The Browser slot is None because
+    launch_persistent_context gives back a BrowserContext directly — there
+    is no separate Browser handle to close. Callers must close ctx and
+    stop pw at shutdown.
+
+    Profile dir lives at config.ROOT / .chrome-profile, so it ends up next
+    to the .exe in frozen mode and at the repo root when running from
+    source. gitignored so we never commit cookies.
 
     Does NOT pre-reload. The reload-on-missing-chat logic lives in
     get_chat_frame — only reload once we've confirmed the chat hasn't
     rendered, instead of reloading eagerly before the initial load has
     finished (which just re-fetches from cache and lands us back in the
-    same half-initialized state)."""
+    same half-initialized state).
+    """
     pw = sync_playwright().start()
-    browser = pw.chromium.launch(headless=False)
-    ctx = browser.new_context(
+    profile_dir = config.ROOT / PROFILE_DIR_NAME
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    ctx = pw.chromium.launch_persistent_context(
+        user_data_dir=str(profile_dir),
+        headless=False,
         viewport={"width": 1366, "height": 850},
         user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -56,12 +74,14 @@ def start_browser() -> tuple[Playwright, Browser, BrowserContext, Page]:
             "Chrome/124.0 Safari/537.36"
         ),
     )
-    page = ctx.new_page()
-    log.info(f"browser launched; navigating to {config.URL}")
+    # launch_persistent_context opens one blank tab by default — reuse it.
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    log.info(f"browser launched (persistent profile: {profile_dir.name})")
+    log.info(f"navigating to {config.URL}")
     page.goto(config.URL, wait_until="domcontentloaded", timeout=60_000)
     page.wait_for_timeout(config.PAGE_LOAD_WAIT_S * 1000)
     install_gateway_listener(page)
-    return pw, browser, ctx, page
+    return pw, None, ctx, page
 
 
 def get_chat_frame(page: Page) -> Frame:

@@ -17,6 +17,10 @@ logs/
 # Local tooling state
 .claude/
 
+# Persistent chromium profile (cookies, local storage, service-worker cache)
+# — private to each operator, never commit
+.chrome-profile/
+
 # PyInstaller build artifacts
 build/
 dist/

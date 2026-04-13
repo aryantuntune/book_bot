@@ -147,22 +147,78 @@ def _install_signal_handler() -> None:
 def main() -> None:
     global _USE_GUI_OTP
 
+    # Handles populated by the GUI bootstrap when we pre-launch the browser
+    # to detect session state. The main try/ block re-uses them instead of
+    # calling start_browser() again.
+    _pre_pw = _pre_browser = _pre_ctx = _pre_page = _pre_frame = None
+
     # No CLI args → show the startup GUI (this is how the bundled .exe runs
     # when an operator double-clicks it). With CLI args we keep the old
     # argparse behavior so dev workflows are unchanged.
     if len(sys.argv) == 1:
         from booking_bot import ui
+        _USE_GUI_OTP = True
+
+        # Minimal logging for the bootstrap phase so the operator sees
+        # browser-launch progress in the console window while they wait
+        # for the dialog. setup_logging() will replace these handlers
+        # after the dialog returns.
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s  %(levelname)-7s  %(name)-12s  %(message)s",
+            datefmt="%H:%M:%S",
+        )
+
+        # Pre-launch the browser to detect whether HPCL still thinks the
+        # session is active. The persistent chrome profile preserves
+        # cookies across runs, so subsequent launches can often skip
+        # operator auth entirely — we only ask the operator for a phone
+        # number when the chat lands in a NEEDS_OPERATOR_* state.
         try:
-            values = ui.prompt_startup()
+            _pre_pw, _pre_browser, _pre_ctx, _pre_page = browser.start_browser()
+            _pre_frame = browser.get_chat_frame(_pre_page)
+            chat.wait_until_settled(_pre_frame)
+            startup_state = chat.detect_state(_pre_frame)
         except Exception as e:
-            print(f"GUI failed to launch ({type(e).__name__}: {e}); "
-                  f"pass an xlsx path on the command line instead.")
+            import tkinter as _tk
+            import tkinter.messagebox as _mb
+            _root = _tk.Tk(); _root.withdraw()
+            _mb.showerror(
+                "Startup failed",
+                f"Could not launch the browser or load HP Gas chat:\n\n"
+                f"{type(e).__name__}: {e}\n\n"
+                f"Check that you're connected to the internet and try again.",
+            )
+            _root.destroy()
+            sys.exit(1)
+
+        session_active = startup_state not in (
+            "NEEDS_OPERATOR_AUTH",
+            "NEEDS_OPERATOR_OTP",
+            "UNKNOWN",
+        )
+        log.info(
+            f"startup detect_state={startup_state!r}; "
+            f"session_active={session_active}"
+        )
+
+        try:
+            values = ui.prompt_startup(ask_phone=not session_active)
+        except Exception as e:
+            log.error(f"GUI failed to launch: {type(e).__name__}: {e}")
+            _close_browser_handles(_pre_ctx, _pre_pw)
             sys.exit(2)
         if values is None:
-            print("cancelled by user")
+            log.info("cancelled by user")
+            _close_browser_handles(_pre_ctx, _pre_pw)
             sys.exit(0)
-        config.OPERATOR_PHONE = values["operator_phone"]
-        _USE_GUI_OTP = True
+
+        # Only overwrite OPERATOR_PHONE when the dialog actually collected
+        # one — if the session was already active, the placeholder stays
+        # and auth.login_if_needed will skip typing it anyway.
+        if not session_active and values["operator_phone"]:
+            config.OPERATOR_PHONE = values["operator_phone"]
+
         args = argparse.Namespace(
             input_file=values["input_file"],
             debug=values["debug"],
@@ -219,9 +275,18 @@ def main() -> None:
     current_phone: str | None = None
 
     try:
-        pw, browser_obj, ctx, page = browser.start_browser()
-        frame = browser.get_chat_frame(page)
-        chat.wait_until_settled(frame)
+        if _pre_pw is not None:
+            # GUI bootstrap already opened the browser and loaded the chat.
+            pw = _pre_pw
+            browser_obj = _pre_browser
+            ctx = _pre_ctx
+            page = _pre_page
+            frame = _pre_frame
+            log.info("re-using pre-launched browser from GUI bootstrap")
+        else:
+            pw, browser_obj, ctx, page = browser.start_browser()
+            frame = browser.get_chat_frame(page)
+            chat.wait_until_settled(frame)
         if pb is not None:
             # Playbook mode: do operator login if the session isn't already
             # active, then let the recording drive all menu navigation.
@@ -469,6 +534,14 @@ def main() -> None:
         _pause_if_keep_open(args.keep_open, frame)
         raise
     finally:
+        # Close the context first (persistent mode) so cookies are flushed
+        # to .chrome-profile/, then close the legacy Browser handle if
+        # present (non-persistent mode), then stop Playwright.
+        if ctx is not None:
+            try:
+                ctx.close()
+            except Exception:
+                pass
         if browser_obj is not None:
             try:
                 browser_obj.close()
@@ -500,6 +573,23 @@ def _recover_with_playbook(page, pb, operator_phone, get_otp):
     login_if_needed(frame, operator_phone, get_otp)
     playbook_mod.replay_auth(frame, pb, operator_phone, get_otp)
     return frame
+
+
+def _close_browser_handles(ctx, pw) -> None:
+    """Best-effort shutdown for the GUI bootstrap path: close the Playwright
+    context (flushes the persistent profile) then stop the driver. Used
+    when the operator cancels the dialog after the browser has already
+    been pre-launched."""
+    if ctx is not None:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+    if pw is not None:
+        try:
+            pw.stop()
+        except Exception:
+            pass
 
 
 def _pause_if_keep_open(keep_open: bool, frame) -> None:

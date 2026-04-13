@@ -17,13 +17,17 @@ from typing import Optional, TypedDict
 
 
 class StartupValues(TypedDict):
-    operator_phone: str
+    operator_phone: str  # empty string when ask_phone=False
     input_file: Path
     debug: bool
     keep_open: bool
 
 
-def prompt_startup() -> Optional[StartupValues]:
+def prompt_startup(ask_phone: bool = True) -> Optional[StartupValues]:
+    """Show the startup dialog. When ask_phone=False (active session
+    detected), the phone field is hidden and the operator only picks the
+    input file + toggles. The returned operator_phone is '' in that case
+    and the caller should not overwrite config.OPERATOR_PHONE."""
     import tkinter as tk
     from tkinter import filedialog, messagebox
 
@@ -45,25 +49,34 @@ def prompt_startup() -> Optional[StartupValues]:
         text="HP Gas Booking Bot",
         font=("Segoe UI", 13, "bold"),
     ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 2))
+    subtitle = (
+        "Session is already active — just pick the input file and click Start."
+        if not ask_phone
+        else "Fill in the details below and click Start."
+    )
     tk.Label(
         frm,
-        text="Fill in the details below and click Start.",
+        text=subtitle,
         font=("Segoe UI", 9),
-        fg="#555",
+        fg="#2a7a2a" if not ask_phone else "#555",
     ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 12))
 
-    tk.Label(frm, text="Operator phone:", font=("Segoe UI", 10)).grid(
-        row=2, column=0, sticky="e", padx=(0, 8), pady=4,
-    )
     phone_var = tk.StringVar()
-    phone_entry = tk.Entry(frm, textvariable=phone_var, width=32, font=("Segoe UI", 10))
-    phone_entry.grid(row=2, column=1, columnspan=2, sticky="we", pady=4)
-    tk.Label(
-        frm,
-        text="(10-digit number registered with HP Gas for OTP)",
-        font=("Segoe UI", 8),
-        fg="#777",
-    ).grid(row=3, column=1, columnspan=2, sticky="w")
+    phone_entry: Optional[tk.Entry] = None
+    if ask_phone:
+        tk.Label(frm, text="Operator phone:", font=("Segoe UI", 10)).grid(
+            row=2, column=0, sticky="e", padx=(0, 8), pady=4,
+        )
+        phone_entry = tk.Entry(
+            frm, textvariable=phone_var, width=32, font=("Segoe UI", 10),
+        )
+        phone_entry.grid(row=2, column=1, columnspan=2, sticky="we", pady=4)
+        tk.Label(
+            frm,
+            text="(10-digit number registered with HP Gas for OTP)",
+            font=("Segoe UI", 8),
+            fg="#777",
+        ).grid(row=3, column=1, columnspan=2, sticky="w")
 
     tk.Label(frm, text="Input Excel file:", font=("Segoe UI", 10)).grid(
         row=4, column=0, sticky="e", padx=(0, 8), pady=(12, 4),
@@ -106,16 +119,18 @@ def prompt_startup() -> Optional[StartupValues]:
     btn_frame.grid(row=8, column=0, columnspan=3, sticky="e", pady=(16, 0))
 
     def _validate_and_submit() -> None:
-        phone = phone_var.get().strip()
         path_str = file_var.get().strip()
-        digits = "".join(ch for ch in phone if ch.isdigit())
-        if len(digits) != 10:
-            messagebox.showerror(
-                "Invalid phone",
-                "Operator phone must be exactly 10 digits.",
-                parent=root,
-            )
-            return
+        digits = ""
+        if ask_phone:
+            phone = phone_var.get().strip()
+            digits = "".join(ch for ch in phone if ch.isdigit())
+            if len(digits) != 10:
+                messagebox.showerror(
+                    "Invalid phone",
+                    "Operator phone must be exactly 10 digits.",
+                    parent=root,
+                )
+                return
         if not path_str:
             messagebox.showerror(
                 "Missing file", "Please select an input .xlsx file.", parent=root,
@@ -148,7 +163,10 @@ def prompt_startup() -> Optional[StartupValues]:
 
     root.bind("<Return>", lambda _e: _validate_and_submit())
     root.bind("<Escape>", lambda _e: _cancel())
-    phone_entry.focus_set()
+    if phone_entry is not None:
+        phone_entry.focus_set()
+    else:
+        file_entry.focus_set()
 
     root.update_idletasks()
     w = root.winfo_reqwidth()
