@@ -217,3 +217,41 @@ def wait_until_settled(frame: Frame, timeout: float | None = None) -> Snapshot:
         f"wait_until_settled timeout after {timeout_s}s "
         f"(activity_seen={activity_seen}, last_hash_changed_at={last_change_time})"
     )
+
+
+# ---- Task 15: _classify_state + detect_state ----
+
+def _classify_state(button_labels: list[str], scroller_text: str) -> str:
+    """Pure classifier — priority 1 is button labels, priority 2 is scroller
+    text. Returns one of config.STATE_PATTERNS' keys or 'UNKNOWN'."""
+    blob_buttons = " | ".join(button_labels)
+    for state_name, patterns in config.STATE_PATTERNS.items():
+        for p in patterns:
+            if p.search(blob_buttons):
+                return state_name
+    for state_name, patterns in config.STATE_PATTERNS.items():
+        for p in patterns:
+            if p.search(scroller_text or ""):
+                return state_name
+    return "UNKNOWN"
+
+
+def detect_state(frame: Frame) -> str:
+    """Thin wrapper: read visible button labels and last 1000 chars of
+    #scroller text from the frame, then delegate to _classify_state."""
+    try:
+        data = frame.evaluate(
+            f"""
+            () => {{
+              const btns = Array.from(document.querySelectorAll('{config.SEL_OPTION}'))
+                .filter(b => b.offsetParent !== null)
+                .map(b => (b.innerText || '').trim());
+              const s = document.querySelector('{config.SEL_SCROLLER}');
+              const text = s ? (s.innerText || '').slice(-1000) : '';
+              return {{buttons: btns, text: text}};
+            }}
+            """
+        )
+    except Exception as e:
+        raise IframeLostError(f"detect_state: {e}") from e
+    return _classify_state(data["buttons"], data["text"])
