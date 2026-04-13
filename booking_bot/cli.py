@@ -331,6 +331,12 @@ def main() -> None:
                     assert result is not None
                     if isinstance(result, chat.Success):
                         store.write_success(row_idx, result.code)
+                    elif result.reason == "ekyc_not_done":
+                        # HPCL blocks this customer's booking until Aadhaar
+                        # eKYC is completed — it's a terminal state but not a
+                        # bot failure, so skip the Issues workbook and write
+                        # a human-readable label directly to col C.
+                        store.mark_terminal(row_idx, "ekyc not done")
                     else:
                         store.write_issue(row_idx, phone, result.reason, result.raw)
                         if not _is_terminal_issue(result.reason):
