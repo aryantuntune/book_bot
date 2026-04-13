@@ -119,6 +119,27 @@ class ExcelStore:
         self._atomic_save(self._issues_wb, self.issues_path)
         log.warning(f"row {row_idx}: ISSUE ({reason})")
 
+    def mark_terminal(self, row_idx: int, col_c_text: str) -> None:
+        """Write a human-readable terminal label to col C (e.g. 'ekyc not
+        done', 'booked'). Unlike write_issue, this does NOT touch the Issues
+        workbook — the label itself tells the operator what happened and the
+        row does not need a diagnostic dump. The outer retry loop treats
+        non-numeric col C values as terminal, so these rows aren't retried."""
+        self._ws.cell(row=row_idx, column=3).value = col_c_text
+        self._atomic_save(self._wb, self.output_path)
+        log.info(f"row {row_idx}: marked terminal = {col_c_text!r}")
+
+    def clear_issue(self, row_idx: int) -> None:
+        """Wipe col C for `row_idx` so pending_rows() picks it up again on
+        the next pass. Used by the transient-retry loop in cli.py — a row
+        that failed with a recoverable reason (unknown_state, playbook_stuck,
+        etc.) gets its ISSUE marker cleared and is re-attempted. Terminal
+        reasons (pending_payment, invalid_customer, already_booked) are left
+        alone."""
+        self._ws.cell(row=row_idx, column=3).value = None
+        self._atomic_save(self._wb, self.output_path)
+        log.info(f"row {row_idx}: cleared for retry")
+
     def _ensure_issues_workbook(self) -> None:
         """Lazily create or open the Issues workbook."""
         if self._issues_wb is not None:
@@ -130,7 +151,11 @@ class ExcelStore:
         self._issues_ws = self._issues_wb.active
 
     def summary(self) -> dict[str, int]:
-        """Count total / success / issue / pending rows by inspecting col C."""
+        """Count total / success / issue / pending rows by inspecting col C.
+
+        Success = col C is a pure digit string (the 6-digit delivery code).
+        Any other non-empty value (ISSUE, 'ekyc not done', 'booked', etc.)
+        counts as a terminal non-success and goes into `issue`."""
         total = success = issue = pending = 0
         for row in self._ws.iter_rows(min_row=1, values_only=True):
             phone = row[1] if len(row) > 1 else None
@@ -140,8 +165,8 @@ class ExcelStore:
             total += 1
             if code is None or str(code).strip() == "":
                 pending += 1
-            elif str(code).strip().upper() == "ISSUE":
-                issue += 1
-            else:
+            elif str(code).strip().isdigit():
                 success += 1
+            else:
+                issue += 1
         return {"total": total, "success": success, "issue": issue, "pending": pending}

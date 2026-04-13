@@ -76,6 +76,24 @@ def _scroller_snapshot(frame: Frame) -> Snapshot:
     return Snapshot(text=text, child_count=children, hash=h)
 
 
+def full_scroller_text(frame: Frame) -> str:
+    """Return the complete #scroller innerText. Used by callers that need to
+    scan the entire chat history (e.g. playbook success detection — the
+    confirmation code may land in the DOM slightly after wait_until_settled
+    returns, so we fall back to the full scroller when a diff-based search
+    comes up empty)."""
+    try:
+        return frame.evaluate(
+            """() => {
+              const s = document.querySelector('#scroller');
+              return s ? (s.innerText || '') : '';
+            }"""
+        ) or ""
+    except Exception as e:
+        log.warning(f"full_scroller_text: {e}")
+        return ""
+
+
 def _loader_visible(frame: Frame) -> bool:
     try:
         return bool(frame.evaluate(
@@ -104,75 +122,104 @@ def send_text(frame: Frame, text: str) -> None:
          `<input type='text'>` inside the chat bubble, paired with a
          `button.submit`. We must type into THAT input, not the generic
          bottom textarea; otherwise the chatbot replies with its "I am
-         still learning" fallback. Selector: any visible non-.replybox
-         input whose type is text/number/tel/password.
+         still learning" fallback.
       2. Fallback: the bottom `textarea.replybox` + `button.reply-submit`
          for free-text interactions with no inline form visible.
 
-    The clear step is essential — leftover content from a prior
-    interaction would otherwise be concatenated."""
+    CRITICAL: HPCL leaves OLD inline inputs from previous chat bubbles in
+    the DOM, sometimes still visible and still enabled. We must always
+    pick the LAST matching element (the newest bubble), never the first
+    one in DOM order — otherwise we type into the OLD bubble's input,
+    which HPCL no longer monitors, and nothing happens.
+
+    Everything runs in a single in-page eval so the input lookup, value
+    set, event dispatch, and submit click are atomic — no chance of the
+    DOM changing between steps."""
     try:
-        inline = frame.evaluate(
+        result = frame.evaluate(
             """
-            () => {
-              const candidates = document.querySelectorAll(
+            (value) => {
+              // 1. Find all inline (non-replybox) text-ish inputs.
+              const all = Array.from(document.querySelectorAll(
                 "input[type='text'], input[type='number'], "
                 + "input[type='tel'], input[type='password']"
-              );
-              for (const el of candidates) {
-                if (el.offsetParent === null) continue;
-                if (el.disabled || el.readOnly) continue;
+              ));
+              // Filter: visible, enabled, not the bottom replybox.
+              const candidates = all.filter(el => {
+                if (el.offsetParent === null) return false;
+                if (el.disabled || el.readOnly) return false;
                 const cls = el.getAttribute('class') || '';
-                if (cls.includes('replybox')) continue;
+                if (cls.includes('replybox')) return false;
+                return true;
+              });
+
+              if (candidates.length > 0) {
+                // Pick the LAST — the newest chat bubble's input.
+                const el = candidates[candidates.length - 1];
+                el.focus();
+                el.value = '';
+                el.value = value;
+                // Fire input+change so jQuery/framework listeners react.
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+
+                // Find the newest enabled button.submit and click it.
+                const submits = Array.from(
+                  document.querySelectorAll('button.submit')
+                ).filter(b => b.offsetParent !== null && !b.disabled);
+                if (submits.length > 0) {
+                  submits[submits.length - 1].click();
+                  return {
+                    ok: true, via: 'inline-submit',
+                    id: el.id || null,
+                    name: el.getAttribute('name'),
+                  };
+                }
+                // No inline submit — dispatch Enter to the input.
+                el.dispatchEvent(new KeyboardEvent('keydown', {
+                  key: 'Enter', code: 'Enter', keyCode: 13,
+                  which: 13, bubbles: true,
+                }));
                 return {
+                  ok: true, via: 'inline-enter',
                   id: el.id || null,
                   name: el.getAttribute('name'),
-                  placeholder: el.getAttribute('placeholder'),
                 };
               }
-              return null;
+
+              // 2. Fallback: bottom textarea.replybox.
+              const ta = document.querySelector('textarea.replybox');
+              if (ta && ta.offsetParent !== null && !ta.disabled) {
+                ta.focus();
+                ta.value = '';
+                ta.value = value;
+                ta.dispatchEvent(new Event('input', {bubbles: true}));
+                ta.dispatchEvent(new Event('change', {bubbles: true}));
+                const btn = document.querySelector('button.reply-submit');
+                if (btn) {
+                  btn.click();
+                  return {ok: true, via: 'replybox'};
+                }
+              }
+              return {ok: false};
             }
-            """
+            """,
+            text,
+        )
+    except Exception as e:
+        raise IframeLostError(f"send_text eval: {e}") from e
+
+    if not result.get("ok"):
+        raise IframeLostError(
+            "send_text: no visible enabled input found (neither inline "
+            "nor replybox)"
         )
 
-        if inline is not None:
-            sel = _build_inline_selector(inline)
-            frame.evaluate(
-                f"() => {{ const el = document.querySelector({sel!r}); "
-                f"if (el) {{ el.value = ''; el.focus(); }} }}"
-            )
-            frame.fill(sel, text)
-            try:
-                frame.click("button.submit", timeout=3_000)
-            except PWTimeoutError:
-                frame.press(sel, "Enter")
-            log.debug(
-                f"send_text(inline {inline.get('id') or inline.get('name')!r}): {text!r}"
-            )
-            return
-
-        # Fallback: bottom textarea.replybox
-        frame.focus(config.SEL_TEXTAREA)
-        frame.evaluate(
-            f"() => {{ const t = document.querySelector('{config.SEL_TEXTAREA}'); "
-            f"if (t) {{ t.value = ''; t.focus(); }} }}"
-        )
-        frame.fill(config.SEL_TEXTAREA, text)
-        frame.click(config.SEL_SUBMIT)
-        log.debug(f"send_text(replybox): {text!r}")
-    except PWTimeoutError as e:
-        raise IframeLostError(f"send_text timeout: {e}") from e
-
-
-def _build_inline_selector(info: dict) -> str:
-    """Build a CSS selector for the inline input we found in `send_text`.
-    Prefers `#id`, falls back to `[name='...']`, then a structural selector
-    of last resort."""
-    if info.get("id"):
-        return f"input#{info['id']}"
-    if info.get("name"):
-        return f"input[name='{info['name']}']"
-    return "input[type='text']:not(.replybox)"
+    via = result.get("via", "?")
+    who = result.get("id") or result.get("name") or ""
+    # Never log OTP/phone contents here — callers (playbook.replay_step
+    # and auth.*) do their own masked logging.
+    log.debug(f"send_text({via} {who!r})")
 
 
 def click_option(frame: Frame, label_patterns: Iterable[re.Pattern[str]]) -> str:

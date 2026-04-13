@@ -1,0 +1,796 @@
+"""Learned playbooks: replay a recording of a successful booking instead of
+hardcoding menu regexes. Decouples bot behaviour from HPCL's current menu
+wording — when HPCL changes the flow, the operator re-records and the bot
+adapts with no code edits.
+
+A playbook is parsed from the JSONL file produced by
+`python -m booking_bot.record`. Its structure:
+
+    auth_prefix  : actions run ONCE at bot startup (operator phone, OTP,
+                   menu nav up to but not including customer-phone entry).
+    booking_body : actions run PER ROW (customer phone, confirmations,
+                   delivery-code read).
+
+Splitting is automatic. Every typed value is classified:
+    - equals config.OPERATOR_PHONE   → 'operator_phone'
+    - 4-8 pure digits (not 10-digit) → 'otp'
+    - 10 pure digits, not operator   → 'customer_phone'
+    - anything else                  → 'literal'
+The first 'customer_phone' TYPE action marks the start of booking_body.
+
+Replay substitutes the runtime values into each slot:
+    - operator_phone → config.OPERATOR_PHONE (at replay_auth)
+    - otp            → get_otp() lazily (prompts fresh every time)
+    - customer_phone → the row's phone
+    - literal        → the recorded value verbatim
+
+Click actions match by id first, then exact case-insensitive text, then
+substring text. If nothing matches we raise OptionNotFoundError so the
+caller knows the recording is out of date.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Literal
+
+from playwright.sync_api import Frame, TimeoutError as PWTimeoutError
+
+from booking_bot import chat, config
+from booking_bot.exceptions import (
+    ChatStuckError,
+    GatewayError,
+    IframeLostError,
+    OptionNotFoundError,
+)
+
+log = logging.getLogger("playbook")
+
+
+ActionKind = Literal["click", "type"]
+ValueSlot = Literal["operator_phone", "otp", "customer_phone", "literal"]
+
+
+@dataclass
+class Action:
+    kind: ActionKind
+    # Click fields
+    button_text: str | None = None
+    button_id: str | None = None
+    button_cls: str | None = None
+    # Type fields
+    input_id: str | None = None
+    input_name: str | None = None
+    input_placeholder: str | None = None
+    value_slot: ValueSlot = "literal"
+    literal_value: str | None = None
+
+    def describe(self) -> str:
+        if self.kind == "click":
+            return f"CLICK {self.button_text!r} (id={self.button_id})"
+        who = self.input_name or self.input_id or self.input_placeholder or "?"
+        return f"TYPE [{self.value_slot}] -> input({who})"
+
+
+@dataclass
+class Playbook:
+    auth_prefix: list[Action] = field(default_factory=list)
+    booking_body: list[Action] = field(default_factory=list)
+    source: str = ""
+
+    def describe(self) -> str:
+        out = [f"Playbook from {self.source}:"]
+        out.append(f"  auth_prefix ({len(self.auth_prefix)} steps):")
+        for a in self.auth_prefix:
+            out.append(f"    - {a.describe()}")
+        out.append(f"  booking_body ({len(self.booking_body)} steps):")
+        for a in self.booking_body:
+            out.append(f"    - {a.describe()}")
+        return "\n".join(out)
+
+
+# ---- Parsing (pure, TDD-able) ----
+
+def classify_value(value: str, operator_phone: str) -> ValueSlot:
+    """Classify a typed value into its replay slot. Pure function — tested
+    in tests/test_playbook_classify.py."""
+    v = (value or "").strip()
+    if not v:
+        return "literal"
+    if v == operator_phone:
+        return "operator_phone"
+    if re.fullmatch(r"\d{10}", v):
+        return "customer_phone"
+    if re.fullmatch(r"\d{4,8}", v):
+        return "otp"
+    return "literal"
+
+
+def _parse_events(jsonl_path: Path) -> list[dict]:
+    events = []
+    for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            log.warning(f"skipping malformed recording line: {e}")
+    return events
+
+
+def _is_submit_button(clicked: dict) -> bool:
+    """Does this click target look like a form-submit button? We skip replaying
+    these when they come paired with a TYPE action, because chat.send_text
+    types+submits atomically — the button is gone by the time CLICK would run."""
+    text = (clicked.get("text") or "").strip().lower()
+    cls = (clicked.get("cls") or "").lower()
+    if "submit" in cls:
+        return True
+    if text in ("submit", "send"):
+        return True
+    return False
+
+
+def events_to_actions(events: list[dict], operator_phone: str) -> list[Action]:
+    """Convert raw recording events into an Action sequence. Pure function.
+
+    Strategy:
+      - For each click event: append TYPE actions for each filledInput
+        (deduped by (input_key, value) — the same filled value may persist
+        across successive clicks that don't clear the form, but a NEW value
+        in the same input is a fresh TYPE). Then append the CLICK action,
+        EXCEPT when it's a Submit-like button and we emitted a TYPE in this
+        same event — chat.send_text already submitted the form, so replaying
+        the Submit click would fail on the now-vanished button.
+      - For each enter_key event: append a TYPE action for the input.
+      - Skip chat_msg, info, header events — they're diagnostic only.
+    """
+    actions: list[Action] = []
+    seen: set[tuple] = set()  # (input_key, slot, value) to avoid dup type actions
+
+    def _maybe_emit_type(inp: dict) -> bool:
+        value = inp.get("value") or ""
+        slot = classify_value(value, operator_phone)
+        key = (
+            inp.get("id") or inp.get("name") or inp.get("placeholder"),
+            slot,
+            value,
+        )
+        if key in seen:
+            return False
+        seen.add(key)
+        actions.append(Action(
+            kind="type",
+            input_id=inp.get("id"),
+            input_name=inp.get("name"),
+            input_placeholder=inp.get("placeholder"),
+            value_slot=slot,
+            literal_value=value if slot == "literal" else None,
+        ))
+        return True
+
+    for ev in events:
+        kind = ev.get("kind")
+        if kind == "click":
+            emitted_type = False
+            for inp in (ev.get("filledInputs") or []):
+                if _maybe_emit_type(inp):
+                    emitted_type = True
+            clicked = ev.get("clicked") or {}
+            if emitted_type and _is_submit_button(clicked):
+                continue
+            actions.append(Action(
+                kind="click",
+                button_text=(clicked.get("text") or "").strip() or None,
+                button_id=clicked.get("id"),
+                button_cls=clicked.get("cls"),
+            ))
+        elif kind == "enter_key":
+            _maybe_emit_type(ev.get("input") or {})
+    return actions
+
+
+def split_playbook(actions: list[Action]) -> tuple[list[Action], list[Action]]:
+    """Split the action list into (auth_prefix, booking_body).
+
+    Single-booking recording (one customer_phone TYPE):
+        auth_prefix  = actions before the customer_phone
+        booking_body = from the customer_phone to the end
+
+    Multi-booking recording (two or more customer_phone TYPEs):
+        auth_prefix  = actions before the FIRST customer_phone
+        booking_body = actions from the FIRST customer_phone up to but NOT
+                       including the SECOND — this captures one full
+                       iteration of the loop (type phone → submit → confirm
+                       → navigate back to "enter customer phone" state),
+                       and drops any trailing cleanup like Main Menu clicks.
+
+    Recording two bookings is strongly preferred: the range between the two
+    customer phones exactly describes what the bot must do per row.
+
+    Raises ValueError if no customer_phone TYPE action was recorded.
+    """
+    cp_indices = [
+        i for i, a in enumerate(actions)
+        if a.kind == "type" and a.value_slot == "customer_phone"
+    ]
+    if not cp_indices:
+        raise ValueError(
+            "no customer_phone TYPE action found in recording. Re-record with "
+            "`python -m booking_bot.record` and make sure you actually book a "
+            "cylinder end-to-end for a 10-digit customer number."
+        )
+    first = cp_indices[0]
+    if len(cp_indices) >= 2:
+        second = cp_indices[1]
+        return actions[:first], actions[first:second]
+    return actions[:first], actions[first:]
+
+
+# Backwards-compat alias for tests that imported the old name.
+split_at_first_customer_phone = split_playbook
+
+
+def load(jsonl_path: str | Path, operator_phone: str | None = None) -> Playbook:
+    """Parse a recording JSONL into an executable Playbook."""
+    if operator_phone is None:
+        operator_phone = config.OPERATOR_PHONE
+    path = Path(jsonl_path)
+    events = _parse_events(path)
+    actions = events_to_actions(events, operator_phone)
+    auth, body = split_playbook(actions)
+    return Playbook(auth_prefix=auth, booking_body=body, source=str(path))
+
+
+# ---- Replay (touches the live frame) ----
+
+def _click_by_action(frame: Frame, action: Action) -> None:
+    """Find and click the button described by `action`. Uses a single
+    in-page JS eval that:
+      1. Collects every button/btn-link/dynamic-message-button.
+      2. Filters to visible AND not-disabled elements.
+      3. Matches against (id preferred) → (exact text) → (substring text).
+      4. Picks the LAST match — HPCL reuses content-ids across repeated
+         chat messages, so the most recent DOM node is almost always the
+         active one. Older instances get `disabled` set and are filtered
+         out anyway, but picking .last is an extra safety net.
+      5. Calls .click() in-page, which dispatches a click event that
+         HPCL's jQuery handlers pick up just like a real mouse click.
+
+    Raises OptionNotFoundError if no enabled element matches."""
+    target_text = (action.button_text or "").strip()
+    target_id = action.button_id
+
+    try:
+        result = frame.evaluate(
+            """
+            ({targetId, targetText}) => {
+              const all = Array.from(document.querySelectorAll(
+                'button, a.btn, .dynamic-message-button'
+              ));
+              const clickable = all.filter(
+                b => b.offsetParent !== null && !b.disabled
+              );
+              const target = (targetText || '').toLowerCase();
+
+              // IMPORTANT: capture el.innerText BEFORE el.click(), because
+              // HPCL's click handler synchronously flips the button to
+              // disabled with text=data-loading-text ('processing...'),
+              // and we'd log the loading text instead of the real label.
+
+              // 1. id match
+              if (targetId) {
+                const byId = clickable.filter(b => b.id === targetId);
+                if (byId.length) {
+                  const el = byId[byId.length - 1];
+                  const text = (el.innerText || '').trim();
+                  el.click();
+                  return {ok: true, how: 'by id', text: text};
+                }
+              }
+
+              // 2. exact text (case-insensitive)
+              if (target) {
+                const byText = clickable.filter(
+                  b => (b.innerText || '').trim().toLowerCase() === target
+                );
+                if (byText.length) {
+                  const el = byText[byText.length - 1];
+                  const text = (el.innerText || '').trim();
+                  el.click();
+                  return {ok: true, how: 'by text', text: text};
+                }
+                // 3. substring match
+                const bySub = clickable.filter(
+                  b => (b.innerText || '').trim().toLowerCase().includes(target)
+                );
+                if (bySub.length) {
+                  const el = bySub[bySub.length - 1];
+                  const text = (el.innerText || '').trim();
+                  el.click();
+                  return {ok: true, how: 'by substring', text: text};
+                }
+              }
+
+              // No match — return diagnostic of all visible buttons
+              const visibleAll = all.filter(b => b.offsetParent !== null);
+              return {
+                ok: false,
+                visible: visibleAll.map(b => ({
+                  text: (b.innerText || '').trim(),
+                  id: b.id || null,
+                  disabled: b.disabled,
+                })),
+              };
+            }
+            """,
+            {"targetId": target_id, "targetText": target_text},
+        )
+    except Exception as e:
+        raise IframeLostError(f"playbook click eval: {e}") from e
+
+    if result.get("ok"):
+        log.info(f"playbook click ({result['how']}): {result['text']!r}")
+        return
+
+    raise OptionNotFoundError(
+        f"playbook click could not find enabled button {target_text!r} "
+        f"(id={target_id!r}); visible: {result.get('visible', [])}"
+    )
+
+
+def _resolve_value(action: Action, context: dict) -> str:
+    """Resolve a TYPE action's value from the replay context. OTP slots
+    prompt lazily so the OTP is always fresh."""
+    slot = action.value_slot
+    if slot == "literal":
+        return action.literal_value or ""
+    if slot == "operator_phone":
+        return context["operator_phone"]
+    if slot == "customer_phone":
+        return context["customer_phone"]
+    if slot == "otp":
+        get_otp: Callable[[], str] = context["get_otp"]
+        return get_otp()
+    raise ValueError(f"unknown value_slot: {slot}")
+
+
+def _replay_step(frame: Frame, action: Action, context: dict) -> None:
+    if action.kind == "click":
+        _click_by_action(frame, action)
+        return
+    value = _resolve_value(action, context)
+    chat.send_text(frame, value)
+    # Never log OTP values; always log customer phones (they're in Excel anyway).
+    display = "***" if action.value_slot == "otp" else value
+    log.info(f"playbook type [{action.value_slot}]: {display!r}")
+
+
+def replay_actions(frame: Frame, actions: list[Action], context: dict) -> str:
+    """Walk `actions` in order, calling chat.wait_until_settled after each.
+    Returns the concatenation of every new-text diff, so callers can scan
+    for SUCCESS_RE."""
+    accumulated = ""
+    total = len(actions)
+    for i, action in enumerate(actions, start=1):
+        log.info(f"playbook step {i}/{total}: {action.describe()}")
+        _replay_step(frame, action, context)
+        snap = chat.wait_until_settled(frame)
+        accumulated += ("\n---\n" if accumulated else "") + snap.text
+    return accumulated
+
+
+def replay_auth(
+    frame: Frame,
+    playbook: Playbook,
+    operator_phone: str,
+    get_otp: Callable[[], str],
+) -> None:
+    """Run the auth_prefix once at bot startup."""
+    log.info(f"playbook auth: {len(playbook.auth_prefix)} steps")
+    context = {
+        "operator_phone": operator_phone,
+        "get_otp": get_otp,
+    }
+    replay_actions(frame, playbook.auth_prefix, context)
+    log.info("playbook auth: done")
+
+
+def reset_to_customer_entry(frame: Frame, playbook: Playbook) -> None:
+    """Navigate the chat from ANY error state back to 'enter customer phone'.
+
+    Called between rows when the previous row ended in Issue (pending payment,
+    invalid LPG number, unknown HPCL state, etc.) — the chat is NOT sitting on
+    the customer-phone input, so we can't just re-enter booking_body.
+
+    Strategy: click Main Menu (HPCL puts a Main Menu button on every error
+    bubble, and _click_by_action picks the last visible enabled one), then
+    replay auth_prefix (Booking Services → Book for Others) which always
+    lands us on the customer-phone input.
+
+    Raises IframeLostError / OptionNotFoundError on click failure — the
+    caller (cli.py) is expected to fall back to full recovery (page reload
+    + full login) in that case.
+    """
+    log.info("playbook: resetting to customer entry via Main Menu")
+    main_menu = Action(kind="click", button_text="Main Menu", button_id=None)
+    _click_by_action(frame, main_menu)
+    chat.wait_until_settled(frame)
+    replay_actions(frame, playbook.auth_prefix, {})
+    log.info("playbook: reset done")
+
+
+# ---- Post-failure state classification ----
+#
+# When a click fails with OptionNotFoundError it usually means HPCL replied
+# with something other than the expected booking flow — most commonly a
+# pending-payment notice, an invalid-customer error, or a service-unavailable
+# message. We inspect the enabled buttons + scroller tail and turn the raw
+# OptionNotFoundError into a human-readable Issue reason. The raw field
+# carries the post-baseline scroller slice so the operator can verify.
+
+_PAYMENT_BTN_RE   = re.compile(r"make\s*payment", re.IGNORECASE)
+_PAYMENT_TEXT_RE  = re.compile(
+    r"pending\s+payment|outstanding\s+amount|please\s+clear\s+.*(dues|payment|amount)"
+    r"|amount\s+due|pay.*before.*booking",
+    re.IGNORECASE,
+)
+_INVALID_TEXT_RE  = re.compile(
+    r"invalid\s+(mobile|lpg|customer|number|consumer)"
+    r"|not\s+(found|registered|valid)"
+    r"|does\s+not\s+(exist|match)"
+    r"|no\s+(record|customer)\s+found"
+    r"|customer\s+not\s+found",
+    re.IGNORECASE,
+)
+_ALREADY_BOOKED_RE = re.compile(
+    r"already\s+booked|cylinder\s+already|refill\s+already|booking\s+.*exists",
+    re.IGNORECASE,
+)
+_EKYC_TEXT_RE = re.compile(
+    r"aadhaar\s*(?:e-?kyc|ekyc)"
+    r"|refill\s+booking\s+is\s+blocked.*ekyc"
+    r"|ekyc\s+is\s+pending"
+    r"|complete\s+(?:aadhaar\s+)?authentication",
+    re.IGNORECASE,
+)
+
+
+def _read_state_snapshot(frame: Frame) -> dict:
+    """Pull visible-enabled button labels + last 1500 chars of scroller in
+    one in-page eval. Used by _wait_for_next_state and _classify_failure."""
+    try:
+        return frame.evaluate(
+            f"""
+            () => {{
+              const btns = Array.from(document.querySelectorAll('{config.SEL_OPTION}'))
+                .filter(b => b.offsetParent !== null);
+              const enabled = btns.filter(b => !b.disabled)
+                .map(b => (b.innerText || '').trim())
+                .filter(t => t.length > 0);
+              const s = document.querySelector('{config.SEL_SCROLLER}');
+              const text = s ? (s.innerText || '').slice(-1500) : '';
+              return {{enabled: enabled, text: text}};
+            }}
+            """
+        ) or {}
+    except Exception as e:
+        log.debug(f"_read_state_snapshot failed: {e}")
+        return {}
+
+
+def _classify_failure(
+    frame: Frame,
+    baseline: str,
+    expected_click_text: str,
+) -> chat.BookingResult:
+    """Inspect the live chat state after a click failed, and return a
+    Success if the booking actually went through, or an Issue otherwise.
+    Reason precedence:
+      0. success — scroller contains 'delivery confirmation code is NNNNNN'
+         (checked FIRST because HPCL's post-booking menu shows a Make Payment
+         button for the just-booked invoice and would otherwise be
+         misclassified as pending_payment)
+      1. ekyc_not_done — scroller mentions Aadhaar eKYC pending / blocked
+      2. pending_payment — 'Make Payment' button visible OR scroller says
+         pending/outstanding/due
+      3. invalid_customer — scroller says invalid/not found/does not exist
+      4. already_booked — scroller says already booked / refill exists
+      5. unknown_state — none of the above matched; include visible buttons
+    """
+    snap = _read_state_snapshot(frame)
+    enabled = snap.get("enabled") or []
+    text = snap.get("text") or ""
+    new_text = _post_baseline_text(text, baseline)
+    # Prefer the per-row slice for text classification so we don't trigger
+    # on an earlier row's error bubble still sitting in the scroller.
+    text_for_search = new_text or text
+
+    # Success takes precedence over every failure reason. HPCL's post-booking
+    # "manage your booking" menu shows a Make Payment button for the *just-
+    # booked* invoice — without this check the payment classifier hijacks
+    # rows that actually succeeded.
+    success_m = config.SUCCESS_RE.search(text_for_search)
+    if success_m:
+        return chat.Success(code=success_m.group(1), raw=text_for_search[-500:])
+
+    if _EKYC_TEXT_RE.search(text_for_search):
+        return chat.Issue(
+            reason="ekyc_not_done",
+            raw=f"enabled_buttons={enabled}; scroller_tail={text_for_search[-500:]!r}",
+        )
+    if any(_PAYMENT_BTN_RE.search(b) for b in enabled) or \
+            _PAYMENT_TEXT_RE.search(text_for_search):
+        return chat.Issue(
+            reason="pending_payment",
+            raw=f"enabled_buttons={enabled}; scroller_tail={text_for_search[-500:]!r}",
+        )
+    if _INVALID_TEXT_RE.search(text_for_search):
+        return chat.Issue(
+            reason="invalid_customer",
+            raw=f"enabled_buttons={enabled}; scroller_tail={text_for_search[-500:]!r}",
+        )
+    if _ALREADY_BOOKED_RE.search(text_for_search):
+        return chat.Issue(
+            reason="already_booked",
+            raw=f"enabled_buttons={enabled}; scroller_tail={text_for_search[-500:]!r}",
+        )
+    return chat.Issue(
+        reason=f"unknown_state (expected click {expected_click_text!r})",
+        raw=f"enabled_buttons={enabled}; scroller_tail={text_for_search[-500:]!r}",
+    )
+
+
+def _wait_for_next_state(
+    frame: Frame,
+    target_text: str,
+    timeout_s: float = 8.0,
+) -> bool:
+    """After a click failed with OptionNotFoundError, HPCL may still be
+    streaming bubbles. Poll for up to `timeout_s` seconds looking for:
+      - the target click text (enabled) — maybe the bot was just early;
+        caller can retry the click
+      - any definitive terminal state (Make Payment button, pending payment
+        text, invalid-customer text) — caller should stop and classify
+
+    Returns True if target_text became available (caller should retry click),
+    False if any terminal state appeared or the timeout elapsed (caller
+    should classify).
+    """
+    deadline = time.monotonic() + timeout_s
+    target_re = re.compile(re.escape(target_text), re.IGNORECASE) if target_text else None
+    while time.monotonic() < deadline:
+        snap = _read_state_snapshot(frame)
+        enabled = snap.get("enabled") or []
+        text = snap.get("text") or ""
+
+        if target_re is not None:
+            for b in enabled:
+                if target_re.search(b):
+                    return True
+
+        # Any terminal signal → stop polling, let classifier take over.
+        if any(_PAYMENT_BTN_RE.search(b) for b in enabled):
+            return False
+        if _PAYMENT_TEXT_RE.search(text) or _INVALID_TEXT_RE.search(text) \
+                or _ALREADY_BOOKED_RE.search(text):
+            return False
+
+        time.sleep(0.5)
+    return False
+
+
+def _post_baseline_text(full: str, baseline: str) -> str:
+    """Return the portion of `full` that appeared AFTER `baseline` was captured.
+
+    Handles two cases:
+      1. Happy case: `full` is `baseline` with new content appended. Return
+         the appended slice.
+      2. HPCL trimmed old scroller bubbles after baseline was captured.
+         `full.startswith(baseline)` is False because the head got clipped.
+         Locate the TAIL of baseline inside `full` (rfind to handle repeated
+         substrings) and return everything after it.
+
+    Returns "" when we can't safely locate baseline inside full — in that
+    case the caller must not claim any success code from this row. Returning
+    the full scroller on fallback is what caused the repeated false-positive
+    bug (rows 10/11 inheriting row 9's confirmation code), so we refuse to
+    guess.
+    """
+    if not baseline:
+        return full
+    if full.startswith(baseline):
+        return full[len(baseline):]
+    tail = baseline[-500:] if len(baseline) > 500 else baseline
+    idx = full.rfind(tail)
+    if idx >= 0:
+        return full[idx + len(tail):]
+    return ""
+
+
+def _salvage_success_from_scroller(frame: Frame, baseline: str = "") -> str | None:
+    """Scan the scroller text that appeared AFTER `baseline` for a SUCCESS_RE
+    match. Used when a post-success navigation click fails: the booking already
+    succeeded, we just can't walk back to the idle state.
+
+    CRITICAL: must only attribute codes that actually belong to THIS row. The
+    scroller contains every prior row's confirmation code too — naively
+    searching the full scroller attributes an old code to the current failing
+    row (observed in production: rows 5, 6, 7 all reported the same 719222
+    from row 5; rows 9, 10, 11 all reported 719225).
+
+    Strategy:
+      1. Strict slice — take the text that appeared past `baseline`
+         (startswith, or rfind on baseline's tail). If SUCCESS_RE matches
+         that slice, return the code.
+      2. Count-delta fallback — if HPCL trimmed the scroller so aggressively
+         that baseline can't be located at all, compare SUCCESS_RE match
+         counts in `baseline` vs `full`. If `full` has strictly more, the
+         newest match is this row's code. If equal, we got nothing new
+         and must not claim a code.
+
+    Returns the 6-digit code or None. Never raises.
+    """
+    try:
+        full = chat.full_scroller_text(frame)
+    except Exception as e:
+        log.warning(f"_salvage_success_from_scroller read failed: {e}")
+        return None
+    new_text = _post_baseline_text(full, baseline)
+    m = config.SUCCESS_RE.search(new_text)
+    if m:
+        return m.group(1)
+    if baseline and new_text == "":
+        baseline_codes = config.SUCCESS_RE.findall(baseline)
+        full_codes = config.SUCCESS_RE.findall(full)
+        if len(full_codes) > len(baseline_codes):
+            log.info(
+                f"salvage count-delta: baseline had {len(baseline_codes)} "
+                f"codes, scroller now has {len(full_codes)} — claiming "
+                f"newest: {full_codes[-1]}"
+            )
+            return full_codes[-1]
+    return None
+
+
+def replay_booking(
+    frame: Frame,
+    playbook: Playbook,
+    customer_phone: str,
+) -> chat.BookingResult:
+    """Run the booking_body for one customer. Returns Success on a
+    SUCCESS_RE match, Issue otherwise.
+
+    Success detection reads the FULL scroller after replay and searches only
+    the post-baseline slice (text that appeared during THIS row). We do NOT
+    search the accumulated per-step diffs from wait_until_settled: when HPCL
+    trims old bubbles mid-row, wait_until_settled's startswith check silently
+    returns the whole scroller as 'new text', which pulls the previous row's
+    confirmation code into accumulated and causes false positives (observed:
+    rows 9→10→11 all reporting 719225). Baseline-relative full-scroller read
+    is the single source of truth.
+
+    On any playbook-level failure the Issue raw includes the chat state so
+    the operator can diagnose from the Issues workbook alone.
+    """
+    context = {"customer_phone": customer_phone}
+    # Baseline MUST be captured before any action runs. Every later success
+    # search is restricted to text that appeared past this point, so earlier
+    # rows' confirmation codes can never be attributed to this row.
+    baseline = chat.full_scroller_text(frame)
+    try:
+        accumulated = replay_actions(frame, playbook.booking_body, context)
+    except OptionNotFoundError as e:
+        # A click couldn't find its target button. Two reasons this happens:
+        #   (a) HPCL is still streaming bubbles — the target will appear in a
+        #       second or two. We poll for it before giving up.
+        #   (b) HPCL responded with a different state entirely (pending
+        #       payment, invalid LPG number, service error). We classify the
+        #       current state into a human-readable Issue so the operator can
+        #       see WHY the row failed in the Issues workbook.
+        # Before either path, check if the booking already succeeded — the
+        # confirmation code may be sitting in the scroller from a trailing
+        # nav click that failed post-success.
+        salvaged = _salvage_success_from_scroller(frame, baseline)
+        if salvaged is not None:
+            log.info(
+                f"salvaged success code {salvaged} after "
+                f"OptionNotFoundError: {e}"
+            )
+            full_now = chat.full_scroller_text(frame)
+            new_text = _post_baseline_text(full_now, baseline)
+            return chat.Success(code=salvaged, raw=new_text[-2000:])
+
+        target_text = ""
+        msg = str(e)
+        m = re.search(r"button\s+'([^']+)'", msg)
+        if m:
+            target_text = m.group(1)
+
+        if target_text and _wait_for_next_state(frame, target_text):
+            # The target appeared. Retry just the failed click by re-running
+            # replay_actions on a fresh baseline — cleanest way to resume
+            # without tracking step indices. Safer: retry the single click
+            # directly rather than restarting the whole body.
+            log.info(
+                f"target button {target_text!r} appeared after retry wait; "
+                f"clicking and finishing booking_body"
+            )
+            try:
+                _click_by_action(
+                    frame,
+                    Action(kind="click", button_text=target_text, button_id=None),
+                )
+                chat.wait_until_settled(frame)
+            except (OptionNotFoundError, ChatStuckError) as retry_e:
+                log.warning(f"post-wait click retry failed: {retry_e}")
+                return _classify_failure(frame, baseline, target_text)
+            # After the delayed click, fall through to post-baseline success
+            # detection below — the remaining recorded steps (e.g. Previous
+            # Menu, Book for Others) are nav-only and safe to skip for this
+            # row; the next row starts with its own baseline + full auth.
+            full_now = chat.full_scroller_text(frame)
+            new_text = _post_baseline_text(full_now, baseline)
+            mm = config.SUCCESS_RE.search(new_text)
+            if mm:
+                return chat.Success(code=mm.group(1), raw=new_text[-2000:])
+            return _classify_failure(frame, baseline, target_text)
+
+        return _classify_failure(frame, baseline, target_text)
+    except ChatStuckError as e:
+        # Wait timed out with no scroller change. HPCL sometimes renders the
+        # confirmation code AFTER wait_until_settled gives up, so poll the
+        # scroller briefly before falling through to classification.
+        deadline = time.monotonic() + 5.0
+        salvaged: str | None = None
+        while time.monotonic() < deadline:
+            salvaged = _salvage_success_from_scroller(frame, baseline)
+            if salvaged is not None:
+                break
+            time.sleep(0.5)
+        if salvaged is not None:
+            log.info(f"salvaged success after ChatStuckError: {e}")
+            full_now = chat.full_scroller_text(frame)
+            new_text = _post_baseline_text(full_now, baseline)
+            return chat.Success(code=salvaged, raw=new_text[-2000:])
+        classified = _classify_failure(frame, baseline, "")
+        if isinstance(classified, chat.Success):
+            return classified
+        if classified.reason.startswith("unknown"):
+            return chat.Issue(
+                reason=f"playbook_stuck:{e}",
+                raw=chat.dump_visible_state(frame),
+            )
+        return classified
+    except (IframeLostError, GatewayError) as e:
+        # Same salvage-first pattern — code may already be in the scroller.
+        salvaged = _salvage_success_from_scroller(frame, baseline)
+        if salvaged is not None:
+            log.info(
+                f"salvaged success code {salvaged} after "
+                f"{type(e).__name__}: {e}"
+            )
+            full_now = chat.full_scroller_text(frame)
+            new_text = _post_baseline_text(full_now, baseline)
+            return chat.Success(code=salvaged, raw=new_text[-2000:])
+        # Transient — re-raise so cli.py can recover and retry.
+        raise
+
+    # Read the scroller after replay finishes and search only the slice that
+    # appeared since baseline.
+    full = chat.full_scroller_text(frame)
+    new_text = _post_baseline_text(full, baseline)
+    m = config.SUCCESS_RE.search(new_text)
+    if m:
+        return chat.Success(code=m.group(1), raw=new_text[-2000:])
+
+    return chat.Issue(
+        reason="playbook_no_success_code",
+        raw=accumulated + "\n---NEW-SCROLLER---\n" + new_text[-2000:]
+        + "\n---VISIBLE---\n" + chat.dump_visible_state(frame),
+    )

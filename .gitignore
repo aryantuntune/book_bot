@@ -4,7 +4,21 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
-logs/*.log
-Output/*.xlsx
-Issues/*.xlsx
+
+# Runtime data — never commit (contains real customer phone numbers)
+Input/
+Output/
+Issues/
+recordings/
+logs/
+*.xlsx
 *.xlsx.tmp
+
+# Local tooling state
+.claude/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+!booking_bot.spec

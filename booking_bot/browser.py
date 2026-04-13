@@ -39,7 +39,13 @@ def gateway_flag() -> bool:
 
 def start_browser() -> tuple[Playwright, Browser, BrowserContext, Page]:
     """Launch a visible Chromium, return (pw, browser, ctx, page). Caller owns
-    the handles and must call browser.close() / pw.stop() at shutdown."""
+    the handles and must call browser.close() / pw.stop() at shutdown.
+
+    Does NOT pre-reload. The reload-on-missing-chat logic lives in
+    get_chat_frame — only reload once we've confirmed the chat hasn't
+    rendered, instead of reloading eagerly before the initial load has
+    finished (which just re-fetches from cache and lands us back in the
+    same half-initialized state)."""
     pw = sync_playwright().start()
     browser = pw.chromium.launch(headless=False)
     ctx = browser.new_context(
@@ -59,28 +65,70 @@ def start_browser() -> tuple[Playwright, Browser, BrowserContext, Page]:
 
 
 def get_chat_frame(page: Page) -> Frame:
-    """Return the page's main frame after waiting for the chat DOM to attach.
+    """Return the page's main frame after waiting for the chat DOM to render.
 
     The direct-URL approach (config.URL points straight to the hpchatbot.hpcl
     PWA) means all of the chat widgets — #scroller, textarea.replybox,
     button.reply-submit, button.dynamic-message-button — live on the
-    top-level document. No iframe drilling. We still wait for SEL_SCROLLER to
-    be attached before returning so callers can treat the frame as
-    chat-ready. Raises IframeLostError if the scroller never attaches."""
-    deadline = time.monotonic() + config.GET_FRAME_TIMEOUT_S
-    last_err: Exception | None = None
-    while time.monotonic() < deadline:
-        try:
-            page.wait_for_selector(
-                config.SEL_SCROLLER, timeout=5_000, state="attached",
+    top-level document. No iframe drilling.
+
+    We wait for SEL_SCROLLER to be attached AND non-empty before returning.
+    HPCL's PWA sometimes stalls on first load — the SPA's service worker
+    and initial fetches complete, but the chat widgets stay blank until a
+    page reload kicks them into rendering. Operators historically fixed
+    this by hitting F5. We do it automatically: if the scroller doesn't
+    show any children within a few seconds, call page.reload() and try
+    again. Retry up to 3 times before giving up.
+
+    Raises IframeLostError if the scroller never becomes populated."""
+    max_reloads = 3
+    per_attempt_timeout_s = 10.0
+    poll_interval_s = 0.5
+
+    for attempt in range(max_reloads + 1):
+        if attempt > 0:
+            log.warning(
+                f"get_chat_frame: chat still empty after attempt {attempt}; "
+                f"reloading page (kick #{attempt})"
             )
-            return page.main_frame
-        except PWTimeoutError as e:
-            last_err = e
-            time.sleep(0.5)
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=60_000)
+            except PWTimeoutError as e:
+                log.warning(f"get_chat_frame: reload {attempt} timed out: {e}")
+                continue
+            page.wait_for_timeout(config.PAGE_LOAD_WAIT_S * 1000)
+
+        deadline = time.monotonic() + per_attempt_timeout_s
+        while time.monotonic() < deadline:
+            try:
+                if _scroller_populated(page):
+                    log.info(
+                        f"get_chat_frame: chat rendered "
+                        f"(attempt {attempt + 1}/{max_reloads + 1})"
+                    )
+                    return page.main_frame
+            except Exception as e:
+                log.debug(f"get_chat_frame poll error: {e}")
+            time.sleep(poll_interval_s)
+
     raise IframeLostError(
-        f"could not attach chat scroller within {config.GET_FRAME_TIMEOUT_S}s: {last_err}"
+        f"chat scroller never populated after {max_reloads + 1} load attempts "
+        f"(total {(max_reloads + 1) * per_attempt_timeout_s:.0f}s)"
     )
+
+
+def _scroller_populated(page: Page) -> bool:
+    """True when #scroller exists AND has at least one child element.
+
+    An empty scroller means the PWA loaded its HTML shell but hasn't
+    rendered any chat bubbles yet — either because it's still initialising
+    or because it needs a reload to kick things."""
+    return bool(page.evaluate(
+        f"""() => {{
+          const s = document.querySelector('{config.SEL_SCROLLER}');
+          return !!(s && s.children && s.children.length > 0);
+        }}"""
+    ))
 
 
 def install_gateway_listener(page: Page) -> None:

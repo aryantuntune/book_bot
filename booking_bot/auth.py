@@ -15,6 +15,68 @@ from booking_bot.exceptions import AuthFailedError, OptionNotFoundError
 log = logging.getLogger("auth")
 
 
+def _wait_for_known_state(frame: Frame, total_timeout_s: float = 20.0) -> str:
+    """Poll detect_state until it returns something other than UNKNOWN, or
+    until total_timeout_s elapses. On first page load, the chat renders
+    asynchronously and UNKNOWN is temporary — it resolves once the welcome
+    + menu messages arrive.
+
+    This polls detect_state directly (a single fast JS evaluate) rather
+    than calling wait_until_settled, because settling has its own 60s
+    timeout that would dominate here when the scroller is already quiet.
+    Short polls also let Ctrl-C break out within ~500ms."""
+    import time
+    deadline = time.monotonic() + total_timeout_s
+    state = "UNKNOWN"
+    attempt = 0
+    while time.monotonic() < deadline:
+        attempt += 1
+        state = chat.detect_state(frame)
+        if state != "UNKNOWN":
+            log.info(f"state resolved after {attempt} polls: {state!r}")
+            return state
+        time.sleep(0.5)
+    log.warning(f"state still UNKNOWN after {total_timeout_s}s and {attempt} polls")
+    return state
+
+
+def login_if_needed(
+    frame: Frame, operator_phone: str, get_otp: Callable[[], str],
+) -> None:
+    """Bring the chat to a logged-in state, doing as little work as possible.
+
+    - NEEDS_OPERATOR_AUTH → type phone, then OTP
+    - NEEDS_OPERATOR_OTP  → type OTP only (phone already accepted)
+    - anything else       → session already active, no-op
+
+    Unlike full_auth, this does NOT walk any menu. Use it when the rest of
+    the navigation is handled by a playbook."""
+    state = _wait_for_known_state(frame)
+    log.info(f"login_if_needed: detected state={state!r}")
+    if state == "UNKNOWN":
+        log.warning(
+            "state is UNKNOWN — cannot tell if session is active. Proceeding "
+            "anyway; the first playbook click will fail loudly if the page "
+            "isn't in the expected state. Visible snapshot for debugging:"
+        )
+        log.warning(chat.dump_visible_state(frame))
+    if state == "NEEDS_OPERATOR_AUTH":
+        log.info(f"typing operator phone {operator_phone[:3]}XXXXXXX")
+        chat.send_text(frame, operator_phone)
+        chat.wait_until_settled(frame)
+        otp = get_otp()
+        log.info("typing OTP (not logged)")
+        chat.send_text(frame, otp)
+        chat.wait_until_settled(frame)
+    elif state == "NEEDS_OPERATOR_OTP":
+        otp = get_otp()
+        log.info("typing OTP (not logged)")
+        chat.send_text(frame, otp)
+        chat.wait_until_settled(frame)
+    else:
+        log.info("session already active; skipping operator auth")
+
+
 def full_auth(frame: Frame, operator_phone: str, get_otp: Callable[[], str]) -> None:
     """Complete operator auth: phone → OTP → walk AUTH_NAV_SEQUENCE until the
     chat is in READY_FOR_CUSTOMER. Raises AuthFailedError on any menu miss."""

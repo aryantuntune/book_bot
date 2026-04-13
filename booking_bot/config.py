@@ -3,10 +3,22 @@ other booking_bot modules — this module is a pure leaf."""
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 # ---- Paths ----
-ROOT       = Path(__file__).resolve().parent.parent
+# When running from source, ROOT is the repo root.
+# When running from a PyInstaller bundle, ROOT is the dir containing the
+# .exe so that Output/, Issues/, and logs/ land next to the binary — users
+# expect their outputs alongside the program, not buried inside _internal/.
+# RESOURCES_ROOT points at the bundle extraction dir (sys._MEIPASS) in
+# frozen mode so we can still find bundled recordings/.
+if getattr(sys, "frozen", False):
+    ROOT           = Path(sys.executable).resolve().parent
+    RESOURCES_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
+else:
+    ROOT           = Path(__file__).resolve().parent.parent
+    RESOURCES_ROOT = ROOT
 INPUT_DIR  = ROOT / "Input"
 OUTPUT_DIR = ROOT / "Output"
 ISSUES_DIR = ROOT / "Issues"
@@ -21,7 +33,11 @@ URL = (
     "https://hpchatbot.hpcl.co.in/pwa/view?data="
     "eyJlSWQiOjEwMCwiZ2xpIjp0cnVlLCJjYW1wYWlnbklkIjoiNjQ1MjAyZTNhMTdlMTZhY2RlOTNhMjhmIiwibGkiOiI4OWJiNzZlYTZlNmY0OTVjOTAwNTc3M2I1MGEzNDMyMSJ9"
 )
-OPERATOR_PHONE = "9209114429"   # operator edits this to their own number
+OPERATOR_PHONE = "XXXXXXXXXX"   # 10-digit number registered with HP Gas for
+                                # OTP auth. Overridden at runtime by the
+                                # startup dialog when the .exe is launched
+                                # without CLI args; set here as a fallback
+                                # for developers running from source.
 
 # ---- Timing (seconds unless suffixed _MS) ----
 PAGE_LOAD_WAIT_S      = 4
