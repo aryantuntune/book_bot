@@ -59,32 +59,27 @@ def start_browser() -> tuple[Playwright, Browser, BrowserContext, Page]:
 
 
 def get_chat_frame(page: Page) -> Frame:
-    """Drill into iframe#webform → iframe[name='iframe'] and return the inner
-    Frame. Retries internally for up to GET_FRAME_TIMEOUT_S seconds. Raises
-    IframeLostError on failure."""
+    """Return the page's main frame after waiting for the chat DOM to attach.
+
+    The direct-URL approach (config.URL points straight to the hpchatbot.hpcl
+    PWA) means all of the chat widgets — #scroller, textarea.replybox,
+    button.reply-submit, button.dynamic-message-button — live on the
+    top-level document. No iframe drilling. We still wait for SEL_SCROLLER to
+    be attached before returning so callers can treat the frame as
+    chat-ready. Raises IframeLostError if the scroller never attaches."""
     deadline = time.monotonic() + config.GET_FRAME_TIMEOUT_S
     last_err: Exception | None = None
     while time.monotonic() < deadline:
         try:
-            outer_el = page.wait_for_selector(
-                config.OUTER_IFRAME_SEL, timeout=5_000, state="attached",
+            page.wait_for_selector(
+                config.SEL_SCROLLER, timeout=5_000, state="attached",
             )
-            outer_frame = outer_el.content_frame()
-            if outer_frame is None:
-                raise IframeLostError("outer frame has no content_frame")
-            inner_el = outer_frame.wait_for_selector(
-                config.INNER_IFRAME_SEL, timeout=5_000, state="attached",
-            )
-            inner_frame = inner_el.content_frame()
-            if inner_frame is None:
-                raise IframeLostError("inner frame has no content_frame")
-            inner_frame.wait_for_load_state("domcontentloaded", timeout=10_000)
-            return inner_frame
-        except (PWTimeoutError, IframeLostError) as e:
+            return page.main_frame
+        except PWTimeoutError as e:
             last_err = e
             time.sleep(0.5)
     raise IframeLostError(
-        f"could not attach inner chat frame within {config.GET_FRAME_TIMEOUT_S}s: {last_err}"
+        f"could not attach chat scroller within {config.GET_FRAME_TIMEOUT_S}s: {last_err}"
     )
 
 

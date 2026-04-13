@@ -13,7 +13,14 @@ ISSUES_DIR = ROOT / "Issues"
 LOGS_DIR   = ROOT / "logs"
 
 # ---- Target ----
-URL            = "https://myhpgas.in"
+# Direct chatbot URL. Navigating to https://myhpgas.in and clicking the
+# launcher leads here via two nested iframes; going direct gives us the same
+# DOM at document level with no iframe drilling. The ?data= token is the
+# HPCL campaign id discovered in recon and is static across sessions.
+URL = (
+    "https://hpchatbot.hpcl.co.in/pwa/view?data="
+    "eyJlSWQiOjEwMCwiZ2xpIjp0cnVlLCJjYW1wYWlnbklkIjoiNjQ1MjAyZTNhMTdlMTZhY2RlOTNhMjhmIiwibGkiOiI4OWJiNzZlYTZlNmY0OTVjOTAwNTc3M2I1MGEzNDMyMSJ9"
+)
 OPERATOR_PHONE = "9XXXXXXXXX"   # operator edits this to their own number
 
 # ---- Timing (seconds unless suffixed _MS) ----
