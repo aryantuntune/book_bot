@@ -255,3 +255,34 @@ def detect_state(frame: Frame) -> str:
     except Exception as e:
         raise IframeLostError(f"detect_state: {e}") from e
     return _classify_state(data["buttons"], data["text"])
+
+
+# ---- Task 16: dump_visible_state ----
+
+def dump_visible_state(frame: Frame) -> str:
+    """Return a compact diagnostic string for FatalError messages and DEBUG
+    logs. Never raises — returns a string even on failure."""
+    try:
+        data = frame.evaluate(
+            f"""
+            () => {{
+              const btns = Array.from(document.querySelectorAll('{config.SEL_OPTION}'))
+                .filter(b => b.offsetParent !== null)
+                .map(b => (b.innerText || '').trim()).slice(0, 20);
+              const s = document.querySelector('{config.SEL_SCROLLER}');
+              const text = s ? (s.innerText || '').slice(-500) : '<no-scroller>';
+              const loader = !!document.querySelector('{config.SEL_LOADER}');
+              return {{
+                buttons: btns, text: text, loader: loader,
+                url: document.location ? document.location.href : '<no-url>'
+              }};
+            }}
+            """
+        )
+        return (
+            f"url={data['url']!r} loader_present={data['loader']} "
+            f"visible_buttons={data['buttons']!r} "
+            f"last_scroller_500={data['text']!r}"
+        )
+    except Exception as e:
+        return f"<dump_visible_state failed: {e}>"
