@@ -21,7 +21,7 @@ URL = (
     "https://hpchatbot.hpcl.co.in/pwa/view?data="
     "eyJlSWQiOjEwMCwiZ2xpIjp0cnVlLCJjYW1wYWlnbklkIjoiNjQ1MjAyZTNhMTdlMTZhY2RlOTNhMjhmIiwibGkiOiI4OWJiNzZlYTZlNmY0OTVjOTAwNTc3M2I1MGEzNDMyMSJ9"
 )
-OPERATOR_PHONE = "9XXXXXXXXX"   # operator edits this to their own number
+OPERATOR_PHONE = "9209114429"   # operator edits this to their own number
 
 # ---- Timing (seconds unless suffixed _MS) ----
 PAGE_LOAD_WAIT_S      = 4
@@ -61,7 +61,8 @@ AFFIRMATIVE_LABELS = _compile_list([
 ])
 
 AUTH_NAV_SEQUENCE = [
-    _compile_list([r"booking\s+services", r"refill"]),
+    _compile_list([r"^main\s+menu$", r"main\s+menu"]),
+    _compile_list([r"booking\s+services", r"refill", r"book\s+cylinder"]),
     _compile_list([r"book\s+for\s+others", r"for\s+others"]),
 ]
 

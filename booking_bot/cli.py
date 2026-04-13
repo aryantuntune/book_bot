@@ -80,6 +80,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(prog="python -m booking_bot")
     ap.add_argument("input_file", type=Path, help="path to Input/*.xlsx")
     ap.add_argument("--debug", action="store_true", help="verbose file logging")
+    ap.add_argument(
+        "--keep-open",
+        action="store_true",
+        help="on any error, dump visible chat state and wait for Enter "
+        "before closing the browser — useful for tuning menu regexes",
+    )
     args = ap.parse_args()
 
     log_path = setup_logging(debug=args.debug)
@@ -166,9 +172,21 @@ def main() -> None:
                 reason=f"fatal_error:{type(e).__name__}",
                 raw=chat.dump_visible_state(frame) if frame else "<no-frame>",
             )
+        _pause_if_keep_open(args.keep_open, frame)
         sys.exit(1)
     except KeyboardInterrupt:
         log.warning("KeyboardInterrupt; shutting down")
+    except Exception as e:
+        # Any unhandled exception — log the visible chat state so Tier-3
+        # tuning doesn't require reproducing the bug to see the buttons.
+        log.error(f"UNHANDLED: {type(e).__name__}: {e}")
+        if frame is not None:
+            try:
+                log.error(f"visible state at failure:\n{chat.dump_visible_state(frame)}")
+            except Exception as inner:
+                log.error(f"  (could not dump visible state: {inner})")
+        _pause_if_keep_open(args.keep_open, frame)
+        raise
     finally:
         if browser_obj is not None:
             try:
@@ -182,6 +200,22 @@ def main() -> None:
                 pass
         log.info(f"final summary: {store.summary()}")
         log.info("booking_bot done")
+
+
+def _pause_if_keep_open(keep_open: bool, frame) -> None:
+    """When --keep-open is set, print a banner and block on input() so the
+    operator can inspect the still-visible browser window before Playwright
+    tears it down in the finally: clause."""
+    if not keep_open:
+        return
+    print("\n" + "=" * 60)
+    print("--keep-open: browser is paused. Inspect the Chrome window,")
+    print("then press Enter here to close it and exit.")
+    print("=" * 60, flush=True)
+    try:
+        input()
+    except EOFError:
+        pass
 
 
 if __name__ == "__main__":
