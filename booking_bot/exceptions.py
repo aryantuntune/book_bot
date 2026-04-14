@@ -29,3 +29,9 @@ class OptionNotFoundError(BookingBotError):
 
 class FatalError(BookingBotError):
     """Unrecoverable: the top-level cli loop writes an ISSUE row and exits."""
+
+
+class ChromeNotInstalledError(FatalError):
+    """The shareable .exe tried to launch via channel="chrome" but the target
+    machine has no Google Chrome install. Carries a human-readable install
+    link that the GUI bootstrap shows directly to the operator."""

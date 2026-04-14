@@ -196,15 +196,19 @@ def main() -> None:
             chat.wait_until_settled(_pre_frame)
             startup_state = chat.detect_state(_pre_frame)
         except Exception as e:
+            from booking_bot.exceptions import ChromeNotInstalledError
             import tkinter as _tk
             import tkinter.messagebox as _mb
             _root = _tk.Tk(); _root.withdraw()
-            _mb.showerror(
-                "Startup failed",
-                f"Could not launch the browser or load HP Gas chat:\n\n"
-                f"{type(e).__name__}: {e}\n\n"
-                f"Check that you're connected to the internet and try again.",
-            )
+            if isinstance(e, ChromeNotInstalledError):
+                _mb.showerror("Google Chrome not installed", str(e))
+            else:
+                _mb.showerror(
+                    "Startup failed",
+                    f"Could not launch the browser or load HP Gas chat:\n\n"
+                    f"{type(e).__name__}: {e}\n\n"
+                    f"Check that you're connected to the internet and try again.",
+                )
             _root.destroy()
             sys.exit(1)
 
@@ -283,6 +287,7 @@ def main() -> None:
 
     store = ExcelStore(args.input_file)
     log.info(f"initial summary: {store.summary()}")
+    log.info(store.progress_line())
 
     pb_path = _resolve_playbook_path(args.playbook, args.no_playbook)
     pb = None
@@ -310,7 +315,9 @@ def main() -> None:
             frame = _pre_frame
             log.info("re-using pre-launched browser from GUI bootstrap")
         else:
-            pw, browser_obj, ctx, page = browser.start_browser(headless=_HEADLESS)
+            pw, browser_obj, ctx, page = browser.start_browser(
+                headless=_HEADLESS,
+            )
             # Initial frame acquisition + settle can fail when HPCL navigates
             # the page mid-wait (observed: frame destroyed ~50s after load,
             # likely a stale profile cookie triggering a redirect). Retry with
@@ -376,6 +383,14 @@ def main() -> None:
         # Terminal reasons (pending_payment, invalid_customer, already_booked,
         # invalid_phone_format) are left alone — retrying them won't change
         # HPCL's answer.
+        # Circuit breaker counter for the 502-cascade pattern. Incremented
+        # each time a row ends in recovery_failed / recovered_but_failed,
+        # reset on any successful row (Success or terminal Issue). When it
+        # exceeds config.MAX_CONSECUTIVE_ROW_FAILURES we abort with a
+        # FatalError so the bot stops chewing through rows during a
+        # sustained HPCL outage instead of marking everything skipped.
+        consecutive_row_failures = 0
+
         for pass_num in range(1, MAX_PASSES + 1):
             pass_start = store.summary()
             log.info(
@@ -430,6 +445,13 @@ def main() -> None:
                                     frame = browser.recover_session(
                                         page, config.OPERATOR_PHONE, _prompt_otp,
                                     )
+                            except FatalError:
+                                # OTP-flood circuit breaker tripped inside
+                                # login_if_needed during recovery. Must NOT
+                                # be caught here — it has to escape the row
+                                # loop and reach cli.main()'s FatalError
+                                # handler so the batch aborts cleanly.
+                                raise
                             except Exception as rec_e:
                                 log.error(
                                     f"recovery after row {row_idx} failed: "
@@ -443,6 +465,41 @@ def main() -> None:
                             time.sleep(config.RETRY_PAUSE_S)
 
                     assert result is not None
+                    # Track consecutive recovery failures for the 502-cascade
+                    # circuit breaker. A "row failure" is a row that ended in
+                    # the cli.py-level recovery path (recovered_but_failed or
+                    # recovery_failed). Anything that produced a real HPCL
+                    # response — Success, terminal Issue, even an unknown
+                    # state — proves the chat is talking back, so it resets
+                    # the counter.
+                    is_recovery_failure = (
+                        isinstance(result, chat.Issue)
+                        and (
+                            result.reason.startswith("recovered_but_failed")
+                            or result.reason.startswith("recovery_failed")
+                        )
+                    )
+                    if is_recovery_failure:
+                        consecutive_row_failures += 1
+                        log.warning(
+                            f"row failure #{consecutive_row_failures}/"
+                            f"{config.MAX_CONSECUTIVE_ROW_FAILURES}: "
+                            f"{result.reason}"
+                        )
+                        if consecutive_row_failures >= config.MAX_CONSECUTIVE_ROW_FAILURES:
+                            raise FatalError(
+                                f"502-cascade circuit breaker tripped: "
+                                f"{consecutive_row_failures} rows in a row failed "
+                                f"in the recovery path. HPCL is in a sustained "
+                                f"outage. Stopping the batch so the rest of the "
+                                f"file isn't marked as skipped. Wait 10-30 "
+                                f"minutes and rerun — pending rows will resume "
+                                f"from where they left off."
+                            )
+                    else:
+                        consecutive_row_failures = 0
+                        browser.reset_rapid_reauth_counter()
+
                     if isinstance(result, chat.Success):
                         store.write_success(row_idx, result.code)
                     elif result.reason == "ekyc_not_done":
@@ -459,6 +516,8 @@ def main() -> None:
                         store.write_issue(row_idx, phone, result.reason, result.raw)
                         if not _is_terminal_issue(result.reason):
                             transient_rows.append(row_idx)
+
+                    log.info(store.progress_line())
 
                     # Post-row navigation. Clean Success leaves us on the
                     # customer-phone input (booking_body's tail is Previous
@@ -480,6 +539,8 @@ def main() -> None:
                                     frame = _recover_with_playbook(
                                         page, pb, config.OPERATOR_PHONE, _prompt_otp,
                                     )
+                                except FatalError:
+                                    raise
                                 except Exception as rec_e:
                                     log.error(
                                         f"recovery after post-issue reset failed: "
@@ -494,7 +555,13 @@ def main() -> None:
                             frame = browser.recover_session(
                                 page, config.OPERATOR_PHONE, _prompt_otp,
                             )
-                except KeyboardInterrupt:
+                except (KeyboardInterrupt, FatalError):
+                    # FatalError must propagate out of the row loop —
+                    # the circuit breakers (rapid reauth in auth.py and
+                    # consecutive row failures above) raise it to abort
+                    # the batch cleanly. Catching it here would defeat
+                    # the abort and let the bot keep looping through the
+                    # 502 cascade forever.
                     raise
                 except Exception as row_e:
                     # Catch-all so a single row's unexpected failure never
@@ -504,6 +571,20 @@ def main() -> None:
                         f"row {row_idx} ({phone}) unexpected error: "
                         f"{type(row_e).__name__}: {row_e}"
                     )
+                    consecutive_row_failures += 1
+                    log.warning(
+                        f"row failure #{consecutive_row_failures}/"
+                        f"{config.MAX_CONSECUTIVE_ROW_FAILURES} "
+                        f"(unexpected:{type(row_e).__name__})"
+                    )
+                    if consecutive_row_failures >= config.MAX_CONSECUTIVE_ROW_FAILURES:
+                        raise FatalError(
+                            f"unexpected-error circuit breaker tripped: "
+                            f"{consecutive_row_failures} rows in a row failed "
+                            f"with unhandled exceptions. Stopping the batch — "
+                            f"this looks like a sustained outage rather than "
+                            f"a one-off glitch. Wait 10-30 minutes and rerun."
+                        ) from row_e
                     try:
                         store.write_issue(
                             row_idx,
@@ -523,6 +604,8 @@ def main() -> None:
                             frame = browser.recover_session(
                                 page, config.OPERATOR_PHONE, _prompt_otp,
                             )
+                    except FatalError:
+                        raise
                     except Exception as rec_e:
                         log.error(
                             f"  (recovery after unexpected error failed: "
@@ -541,6 +624,7 @@ def main() -> None:
                 f"transient={len(transient_rows)}; "
                 f"summary={store.summary()} ==="
             )
+            log.info(store.progress_line())
 
             if not transient_rows:
                 log.info("no transient failures; done processing")
@@ -608,25 +692,89 @@ def main() -> None:
             except Exception:
                 pass
         log.info(f"final summary: {store.summary()}")
+        log.info(store.progress_line())
         log.info("booking_bot done")
 
 
 def _recover_with_playbook(page, pb, operator_phone, get_otp):
-    """Playbook-aware recovery: reload the page, re-acquire the chat frame,
-    login if the session dropped, then navigate to customer-phone entry via
-    reset_to_customer_entry. The reset helper handles both the normal path
-    (Main Menu → auth_prefix) and the alt path (Book With Other Mobile) —
-    the latter matters because HPCL's chat state persists across page
-    reloads via the operator session cookie, so a reload landing on the
-    "not registered" alt menu would dead-end on blind auth_prefix replay.
+    """Playbook-aware recovery: gateway-aware, reload only as a last resort.
 
-    Does NOT call wait_until_settled after the reload — login_if_needed
-    polls detect_state directly, which is faster and doesn't block on a
-    quiet scroller (wait_until_settled would spin for its full 60s timeout
-    if the page reloaded into a state with no pending activity)."""
+    The old flow was "reload + re-auth if needed" which caused the OTP flood
+    during gateway flaps: the reload itself would hit a 502, the second 502
+    would destroy the session, and the operator would be prompted for OTP
+    on every row. The new flow is:
+
+      1. Wait GATEWAY_QUIESCE_S for HPCL's upstream to recover.
+      2. Try to use the CURRENT frame in-place. If scroller is still
+         populated and detect_state returns a known state, run
+         reset_to_customer_entry without reloading.
+      3. Only if the in-place attempt raises or the state is UNKNOWN do we
+         fall back to a page reload + full recovery.
+
+    reset_to_customer_entry handles the normal path (Main Menu →
+    auth_prefix) and the alt path (Book With Other Mobile) — the latter
+    matters because HPCL's chat state persists across page reloads via the
+    operator session cookie, so a reload landing on the "not registered"
+    alt menu would dead-end on blind auth_prefix replay.
+    """
+    log.warning(
+        f"playbook recover: waiting {config.GATEWAY_QUIESCE_S}s for gateway "
+        f"to quiesce before touching the page"
+    )
+    browser.reset_gateway_flag()
+    time.sleep(config.GATEWAY_QUIESCE_S)
+
+    # Fast path: the frame is still alive and the gateway hiccup was a
+    # single-request 502. Poll the in-place state for up to
+    # config.IN_PLACE_POLL_S seconds — reloads are what destroys the HPCL
+    # session and triggers the OTP flood, so we try VERY hard to recover
+    # without one.
+    poll_deadline = time.monotonic() + config.IN_PLACE_POLL_S
+    last_state = "UNKNOWN"
+    while time.monotonic() < poll_deadline:
+        try:
+            if not browser._scroller_populated(page):
+                last_state = "<empty>"
+            else:
+                frame = page.main_frame
+                state = chat.detect_state(frame)
+                last_state = state
+                if state != "UNKNOWN":
+                    log.info(
+                        f"playbook recover: in-place state={state!r}; "
+                        f"resetting without reload"
+                    )
+                    try:
+                        playbook_mod.reset_to_customer_entry(frame, pb)
+                        return frame
+                    except (OptionNotFoundError, ChatStuckError) as reset_e:
+                        log.warning(
+                            f"playbook recover: in-place reset failed "
+                            f"({type(reset_e).__name__}: {reset_e}); "
+                            f"continuing to poll"
+                        )
+        except Exception as e:
+            log.debug(
+                f"playbook recover: in-place poll error "
+                f"({type(e).__name__}: {e})"
+            )
+        time.sleep(1.0)
+    log.info(
+        f"playbook recover: in-place gave up after {config.IN_PLACE_POLL_S}s "
+        f"(last={last_state!r}); falling back to reload"
+    )
+
     log.warning("playbook recover: reloading page")
+    browser.reset_gateway_flag()
     page.reload(wait_until="domcontentloaded", timeout=60_000)
     page.wait_for_timeout(config.PAGE_LOAD_WAIT_S * 1000)
+    if browser.gateway_flag():
+        log.warning(
+            f"playbook recover: reload hit gateway error; waiting "
+            f"{config.GATEWAY_RELOAD_WAIT_S}s before proceeding"
+        )
+        browser.reset_gateway_flag()
+        time.sleep(config.GATEWAY_RELOAD_WAIT_S)
     frame = browser.get_chat_frame(page)
     login_if_needed(frame, operator_phone, get_otp)
     try:

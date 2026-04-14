@@ -113,7 +113,7 @@ def _loader_visible(frame: Frame) -> bool:
 
 # ---- Public primitives ----
 
-def send_text(frame: Frame, text: str) -> None:
+def send_text(frame: Frame, text: str, require_inline: bool = False) -> None:
     """Type `text` and submit it to the chatbot.
 
     Priority order:
@@ -125,6 +125,15 @@ def send_text(frame: Frame, text: str) -> None:
          still learning" fallback.
       2. Fallback: the bottom `textarea.replybox` + `button.reply-submit`
          for free-text interactions with no inline form visible.
+
+    require_inline: when True, refuse to use the textarea fallback. Used
+    for structured values (operator phone, customer phone, OTP) where
+    HPCL is in a form-input state — typing into the textarea instead
+    sends the digits into chat, HPCL ignores them, and the bot moves on
+    thinking the row was processed (the actual root cause of the
+    "row-skipping by typing numbers into the chat bar" bug). Raises
+    IframeLostError when the inline input isn't there so the caller can
+    trigger recovery instead of silently corrupting the row.
 
     CRITICAL: HPCL leaves OLD inline inputs from previous chat bubbles in
     the DOM, sometimes still visible and still enabled. We must always
@@ -153,9 +162,19 @@ def send_text(frame: Frame, text: str) -> None:
                 return true;
               });
 
-              if (candidates.length > 0) {
+              // Prefer empty inputs. HPCL leaves the OLD prompt's input in
+              // the DOM after a click — visible AND enabled — and it's
+              // already filled with the previous value. Picking the LAST
+              // candidate blindly would type the new value into that stale
+              // dead field. Empty inputs are always the fresh prompt.
+              const empty = candidates.filter(el =>
+                !el.value || el.value.trim().length === 0
+              );
+              const pool = empty.length > 0 ? empty : candidates;
+
+              if (pool.length > 0) {
                 // Pick the LAST — the newest chat bubble's input.
-                const el = candidates[candidates.length - 1];
+                const el = pool[pool.length - 1];
                 el.focus();
                 el.value = '';
                 el.value = value;
@@ -216,6 +235,12 @@ def send_text(frame: Frame, text: str) -> None:
         )
 
     via = result.get("via", "?")
+    if require_inline and via == "replybox":
+        raise IframeLostError(
+            "send_text: structured value required inline form input but "
+            "only the bottom replybox was available — chat is not in a "
+            "form-input state. Refusing to send to chat as free text."
+        )
     who = result.get("id") or result.get("name") or ""
     # Never log OTP/phone contents here — callers (playbook.replay_step
     # and auth.*) do their own masked logging.
@@ -347,24 +372,90 @@ def _classify_state(button_labels: list[str], scroller_text: str) -> str:
 
 
 def detect_state(frame: Frame) -> str:
-    """Thin wrapper: read visible button labels and last 1000 chars of
-    #scroller text from the frame, then delegate to _classify_state."""
+    """Read interactive DOM state and classify with a strict priority order:
+
+      1. Enabled menu buttons — strongest signal, what the user can click NOW.
+         HPCL leaves clicked buttons visible-but-disabled in the transcript;
+         only ENABLED buttons drive classification. Filtering out disabled
+         buttons is what stops a stale "Book for Others" bubble from
+         re-classifying us as BOOK_FOR_OTHERS_MENU after we've moved on.
+
+      2. Explicit auth/OTP scroller-text patterns — these strings are
+         unique to HPCL's auth gate and never appear in normal booking
+         flow, so checking them here is safe before the input-presence
+         heuristic (which would otherwise misread an auth input as the
+         customer-phone prompt).
+
+      3. An EMPTY inline <input> that isn't the replybox — when buttons
+         and auth-text don't match, an empty form field means HPCL is
+         waiting for the next customer phone. This is what unblocks the
+         post-click case where the customer-phone prompt is rendered but
+         the scroller tail still contains "Book for Others" text from the
+         just-dismissed menu bubble. The input MUST be empty so we don't
+         confuse the OLD filled customer-phone input from the
+         just-completed row with a fresh prompt.
+
+      4. Last-resort scroller-text classifier — used only when nothing
+         interactive is in view (chat mid-load).
+
+    The bug this fixes (prod log 2026-04-14 16:25): after clicking
+    "Book for Others", all menu buttons go disabled and HPCL renders an
+    empty `<input name='newmobile'>` for the customer phone. The OLD
+    code's `_classify_state` saw zero enabled buttons, fell through to
+    the scroller text, matched `book\\s+for\\s+others` from the dismissed
+    bubble (because BOOK_FOR_OTHERS_MENU is checked before
+    READY_FOR_CUSTOMER in dict order), and reported BOOK_FOR_OTHERS_MENU
+    forever. The bot kept clicking "Book for Others" → landing back on
+    the same prompt → re-misclassifying → looping.
+    """
     try:
         data = frame.evaluate(
             f"""
             () => {{
               const btns = Array.from(document.querySelectorAll('{config.SEL_OPTION}'))
-                .filter(b => b.offsetParent !== null)
+                .filter(b => b.offsetParent !== null && !b.disabled)
                 .map(b => (b.innerText || '').trim());
+              const inputs = Array.from(document.querySelectorAll(
+                "input[type='text'], input[type='number'], input[type='tel'], input[type='password']"
+              )).filter(el => {{
+                if (el.offsetParent === null) return false;
+                if (el.disabled || el.readOnly) return false;
+                const cls = el.getAttribute('class') || '';
+                if (cls.includes('replybox')) return false;
+                if (el.value && el.value.trim().length > 0) return false;
+                return true;
+              }});
               const s = document.querySelector('{config.SEL_SCROLLER}');
               const text = s ? (s.innerText || '').slice(-1000) : '';
-              return {{buttons: btns, text: text}};
+              return {{buttons: btns, text: text, hasEmptyInput: inputs.length > 0}};
             }}
             """
         )
     except Exception as e:
         raise IframeLostError(f"detect_state: {e}") from e
-    return _classify_state(data["buttons"], data["text"])
+
+    buttons = data["buttons"]
+    text = data["text"]
+    has_empty_input = bool(data.get("hasEmptyInput"))
+
+    # Priority 1: enabled menu buttons.
+    if buttons:
+        button_state = _classify_state(buttons, "")
+        if button_state != "UNKNOWN":
+            return button_state
+
+    # Priority 2: explicit auth/OTP patterns from scroller text.
+    for state_name in ("NEEDS_OPERATOR_AUTH", "NEEDS_OPERATOR_OTP"):
+        for p in config.STATE_PATTERNS[state_name]:
+            if p.search(text or ""):
+                return state_name
+
+    # Priority 3: empty inline input → customer-phone prompt.
+    if has_empty_input:
+        return "READY_FOR_CUSTOMER"
+
+    # Priority 4: weakest fallback — scroller text only.
+    return _classify_state([], text)
 
 
 # ---- Task 16: dump_visible_state ----

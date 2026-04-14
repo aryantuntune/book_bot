@@ -20,6 +20,7 @@ logs/
 # Persistent chromium profile (cookies, local storage, service-worker cache)
 # — private to each operator, never commit
 .chrome-profile/
+.chromium-profile/
 
 # PyInstaller build artifacts
 build/

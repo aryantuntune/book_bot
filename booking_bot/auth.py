@@ -10,7 +10,7 @@ from typing import Callable
 from playwright.sync_api import Frame
 
 from booking_bot import chat, config
-from booking_bot.exceptions import AuthFailedError, OptionNotFoundError
+from booking_bot.exceptions import AuthFailedError, FatalError, OptionNotFoundError
 
 log = logging.getLogger("auth")
 
@@ -51,8 +51,53 @@ def login_if_needed(
 
     Unlike full_auth, this does NOT walk any menu. Use it when the rest of
     the navigation is handled by a playbook."""
+    import time
+    from booking_bot import browser  # late import to avoid cycle
+
     state = _wait_for_known_state(frame)
     log.info(f"login_if_needed: detected state={state!r}")
+
+    # Recent-auth guard: HPCL's PWA occasionally flashes the login screen
+    # briefly after a reload that followed a gateway hiccup, even though the
+    # server-side session is still valid. If we authed successfully less
+    # than RECENT_AUTH_WINDOW_S ago, wait once and re-read state before
+    # asking the operator for an OTP they just typed.
+    if state == "NEEDS_OPERATOR_AUTH":
+        age = browser.last_auth_age_s()
+        if age is not None and age < config.RECENT_AUTH_WINDOW_S:
+            log.warning(
+                f"NEEDS_OPERATOR_AUTH detected {age:.0f}s after a successful "
+                f"auth — waiting {config.RECENT_AUTH_RECHECK_S}s to see if "
+                f"HPCL settles back into the logged-in state"
+            )
+            time.sleep(config.RECENT_AUTH_RECHECK_S)
+            state = _wait_for_known_state(frame)
+            log.info(f"login_if_needed: after re-check, state={state!r}")
+            if state == "NEEDS_OPERATOR_AUTH":
+                # The recheck didn't help — HPCL really is back on the login
+                # screen. This is the OTP-flood pattern: the operator just
+                # typed an OTP, we accepted it, and now we're being asked for
+                # another one. Increment the rapid-reauth counter; if we've
+                # done this too many times in a row, abort the batch instead
+                # of burning through the operator's daily OTP quota.
+                count = browser.note_rapid_reauth()
+                log.warning(
+                    f"rapid re-auth detected (#{count}/"
+                    f"{config.MAX_CONSECUTIVE_REAUTHS}): NEEDS_OPERATOR_AUTH "
+                    f"persisted past the recheck"
+                )
+                if count >= config.MAX_CONSECUTIVE_REAUTHS:
+                    raise FatalError(
+                        f"OTP-flood circuit breaker tripped: detected "
+                        f"NEEDS_OPERATOR_AUTH within {config.RECENT_AUTH_WINDOW_S}s "
+                        f"of the last successful auth {count} times in a row. "
+                        f"HPCL's session is being destroyed faster than we can "
+                        f"re-establish it — typically a sustained gateway "
+                        f"outage. Stopping the batch so the operator's daily "
+                        f"OTP quota isn't burned. Wait 10-30 minutes and "
+                        f"rerun; the bot will resume from where it left off."
+                    )
+
     if state == "UNKNOWN":
         log.warning(
             "state is UNKNOWN — cannot tell if session is active. Proceeding "
@@ -68,18 +113,23 @@ def login_if_needed(
         log.info("typing OTP (not logged)")
         chat.send_text(frame, otp)
         chat.wait_until_settled(frame)
+        browser.mark_auth_success()
     elif state == "NEEDS_OPERATOR_OTP":
         otp = get_otp()
         log.info("typing OTP (not logged)")
         chat.send_text(frame, otp)
         chat.wait_until_settled(frame)
+        browser.mark_auth_success()
     else:
         log.info("session already active; skipping operator auth")
+        browser.mark_auth_success()
 
 
 def full_auth(frame: Frame, operator_phone: str, get_otp: Callable[[], str]) -> None:
     """Complete operator auth: phone → OTP → walk AUTH_NAV_SEQUENCE until the
     chat is in READY_FOR_CUSTOMER. Raises AuthFailedError on any menu miss."""
+    from booking_bot import browser  # late import to avoid cycle
+
     log.info(f"auth: typing operator phone {operator_phone[:3]}XXXXXXX")
     chat.send_text(frame, operator_phone)
     chat.wait_until_settled(frame)
@@ -88,6 +138,7 @@ def full_auth(frame: Frame, operator_phone: str, get_otp: Callable[[], str]) -> 
     log.info("auth: typing OTP (not logged)")
     chat.send_text(frame, otp)
     chat.wait_until_settled(frame)
+    browser.mark_auth_success()
 
     navigate_to_book_for_others(frame)
 

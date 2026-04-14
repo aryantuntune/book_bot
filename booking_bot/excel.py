@@ -151,12 +151,22 @@ class ExcelStore:
         self._issues_ws = self._issues_wb.active
 
     def summary(self) -> dict[str, int]:
-        """Count total / success / issue / pending rows by inspecting col C.
+        """Classify every row by col C value so the CLI can log progress.
 
-        Success = col C is a pure digit string (the 6-digit delivery code).
-        Any other non-empty value (ISSUE, 'ekyc not done', 'booked', etc.)
-        counts as a terminal non-success and goes into `issue`."""
-        total = success = issue = pending = 0
+        Buckets:
+          success        — col C is a pure 6-digit delivery confirmation code
+          ekyc           — 'ekyc not done' terminal label
+          not_registered — 'not registered with HPCL' terminal label
+          payment_pending — 'payment pending' terminal label
+          issue          — any other non-empty value (usually literal 'ISSUE',
+                           but also future terminal labels we haven't special-
+                           cased yet)
+          pending        — col C is None or blank
+
+        Returns a dict with all buckets plus `total`. `done` is a convenience
+        alias for success + all terminal buckets — it's the progress bar
+        numerator that stays stable across retry passes."""
+        total = success = ekyc = not_registered = payment_pending = issue = pending = 0
         for row in self._ws.iter_rows(min_row=1, values_only=True):
             phone = row[1] if len(row) > 1 else None
             code  = row[2] if len(row) > 2 else None
@@ -165,8 +175,42 @@ class ExcelStore:
             total += 1
             if code is None or str(code).strip() == "":
                 pending += 1
-            elif str(code).strip().isdigit():
+                continue
+            c = str(code).strip()
+            if c.isdigit():
                 success += 1
+            elif c.lower() == "ekyc not done":
+                ekyc += 1
+            elif c.lower() == "not registered with hpcl":
+                not_registered += 1
+            elif c.lower() == "payment pending":
+                payment_pending += 1
             else:
                 issue += 1
-        return {"total": total, "success": success, "issue": issue, "pending": pending}
+        done = success + ekyc + not_registered + payment_pending + issue
+        return {
+            "total": total,
+            "done": done,
+            "success": success,
+            "ekyc": ekyc,
+            "not_registered": not_registered,
+            "payment_pending": payment_pending,
+            "issue": issue,
+            "pending": pending,
+        }
+
+    def progress_line(self) -> str:
+        """One-line human-readable progress for log output. Shows how many
+        rows are resolved (done/total) with a per-bucket breakdown so the
+        operator can see at a glance whether the remaining pending rows are
+        shrinking. Example output:
+
+            progress: 15/136 done (success=10 ekyc=2 not_reg=1 pay_pend=1 issue=1) pending=121
+        """
+        s = self.summary()
+        return (
+            f"progress: {s['done']}/{s['total']} done "
+            f"(success={s['success']} ekyc={s['ekyc']} "
+            f"not_reg={s['not_registered']} pay_pend={s['payment_pending']} "
+            f"issue={s['issue']}) pending={s['pending']}"
+        )

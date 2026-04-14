@@ -9,10 +9,14 @@ Responsibilities:
    ``--headless`` in argv: skip console setup entirely so the bot runs
    fully in the background with no visible window.
 
-2. Point PLAYWRIGHT_DRIVER_PATH at the bundled playwright/driver/ so the
-   driver's node.exe launches correctly. We use system Google Chrome via
-   ``channel="chrome"`` in start_browser(), so we no longer bundle
-   chromium-1134 / ffmpeg-1010 and PLAYWRIGHT_BROWSERS_PATH is unused.
+2. Point PLAYWRIGHT_BROWSERS_PATH at the bundled ms-playwright/ so the
+   driver finds the embedded chromium-1134 and ffmpeg-1010. Also point
+   PLAYWRIGHT_DRIVER_PATH at the bundled playwright/driver/ so the driver's
+   node.exe launches correctly. Bundled Chromium is used unconditionally
+   in the frozen .exe — it's the only browser we can guarantee on a
+   client's machine AND its persistent user-data dir actually survives
+   restarts, unlike system Chrome which kept dropping the HPCL session
+   and triggering OTP re-prompts.
 
 This file is only referenced by booking_bot.spec (runtime_hooks=) and is a
 no-op when executed from a normal Python interpreter.
@@ -56,8 +60,11 @@ if getattr(sys, "frozen", False):
             # Console allocation is cosmetic — never let it kill startup.
             pass
 
-    # ---- Playwright driver path ----
+    # ---- Playwright browsers + driver paths ----
     base = Path(getattr(sys, "_MEIPASS", "."))
-    driver_path = base / "playwright" / "driver"
+    browsers_path = base / "ms-playwright"
+    driver_path   = base / "playwright" / "driver"
+    if browsers_path.exists():
+        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(browsers_path))
     if driver_path.exists():
         os.environ.setdefault("PLAYWRIGHT_DRIVER_PATH", str(driver_path))

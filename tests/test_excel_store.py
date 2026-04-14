@@ -164,4 +164,109 @@ def test_summary_reports_counts(store_env):
     # rows 3, 4 still pending
 
     s = store.summary()
-    assert s == {"total": 4, "success": 1, "issue": 1, "pending": 2}
+    assert s == {
+        "total": 4,
+        "done": 2,
+        "success": 1,
+        "ekyc": 0,
+        "not_registered": 0,
+        "payment_pending": 0,
+        "issue": 1,
+        "pending": 2,
+    }
+
+
+def test_summary_classifies_terminal_labels(store_env):
+    inp = _make_input(store_env, [
+        ("C1", "9876543210"),
+        ("C2", "9123456789"),
+        ("C3", "9000000000"),
+        ("C4", "9111111111"),
+        ("C5", "9222222222"),
+        ("C6", "9333333333"),
+        ("C7", "9444444444"),
+        ("C8", "9555555555"),
+    ])
+    store = ExcelStore(inp)
+    store.write_success(1, "719285")
+    store.mark_terminal(2, "ekyc not done")
+    store.mark_terminal(3, "not registered with HPCL")
+    store.mark_terminal(4, "payment pending")
+    store.write_issue(5, "9222222222", "unexpected_state", "raw")
+    store.write_success(6, "719286")
+    # rows 7, 8 still pending
+
+    s = store.summary()
+    assert s["total"] == 8
+    assert s["success"] == 2
+    assert s["ekyc"] == 1
+    assert s["not_registered"] == 1
+    assert s["payment_pending"] == 1
+    assert s["issue"] == 1
+    assert s["pending"] == 2
+    assert s["done"] == 6
+    # done should never double-count: success + terminals + issue
+    assert s["done"] == s["success"] + s["ekyc"] + s["not_registered"] \
+        + s["payment_pending"] + s["issue"]
+    assert s["done"] + s["pending"] == s["total"]
+
+
+def test_summary_terminal_label_matching_is_case_insensitive(store_env):
+    inp = _make_input(store_env, [
+        ("C1", "9876543210"),
+        ("C2", "9123456789"),
+        ("C3", "9000000000"),
+    ])
+    store = ExcelStore(inp)
+    # Operator may hand-edit the file with mixed casing.
+    import openpyxl
+    wb = openpyxl.load_workbook(store.output_path)
+    ws = wb.active
+    ws.cell(row=1, column=3).value = "EKYC Not Done"
+    ws.cell(row=2, column=3).value = "Not Registered With HPCL"
+    ws.cell(row=3, column=3).value = "PAYMENT PENDING"
+    wb.save(store.output_path)
+
+    # Reload so the store sees the hand-edited labels.
+    store2 = ExcelStore(inp)
+    s = store2.summary()
+    assert s["ekyc"] == 1
+    assert s["not_registered"] == 1
+    assert s["payment_pending"] == 1
+    assert s["issue"] == 0
+
+
+def test_progress_line_formats_all_buckets(store_env):
+    inp = _make_input(store_env, [
+        ("C1", "9876543210"),
+        ("C2", "9123456789"),
+        ("C3", "9000000000"),
+    ])
+    store = ExcelStore(inp)
+    store.write_success(1, "719285")
+    store.mark_terminal(2, "ekyc not done")
+    # row 3 pending
+
+    line = store.progress_line()
+    # Must contain done/total, plus every bucket label so operators can
+    # eyeball any category growing unexpectedly.
+    assert "2/3 done" in line
+    assert "success=1" in line
+    assert "ekyc=1" in line
+    assert "not_reg=0" in line
+    assert "pay_pend=0" in line
+    assert "issue=0" in line
+    assert "pending=1" in line
+
+
+def test_progress_line_on_empty_file(store_env):
+    # Edge case: input file with zero data rows. progress_line should not
+    # crash and should show 0/0 cleanly.
+    inp = _make_input(store_env, [])
+    store = ExcelStore(inp)
+    s = store.summary()
+    assert s["total"] == 0
+    assert s["done"] == 0
+    assert s["pending"] == 0
+    line = store.progress_line()
+    assert "0/0 done" in line

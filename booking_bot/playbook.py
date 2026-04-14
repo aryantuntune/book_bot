@@ -365,7 +365,16 @@ def _replay_step(frame: Frame, action: Action, context: dict) -> None:
         _click_by_action(frame, action)
         return
     value = _resolve_value(action, context)
-    chat.send_text(frame, value)
+    # Structured values (operator phone, customer phone, OTP) are sent in
+    # response to an inline form prompt. Forbid the textarea fallback so
+    # we never silently dump a phone number into the chat bar — that's
+    # what caused the "row-skipping by typing into the wrong field" bug
+    # whenever post-recovery state detection landed somewhere other than
+    # the customer-phone form.
+    require_inline = action.value_slot in (
+        "operator_phone", "customer_phone", "otp",
+    )
+    chat.send_text(frame, value, require_inline=require_inline)
     # Never log OTP values; always log customer phones (they're in Excel anyway).
     display = "***" if action.value_slot == "otp" else value
     log.info(f"playbook type [{action.value_slot}]: {display!r}")
@@ -391,38 +400,178 @@ def replay_auth(
     operator_phone: str,
     get_otp: Callable[[], str],
 ) -> None:
-    """Run the auth_prefix once at bot startup."""
+    """Run the auth_prefix once at bot startup.
+
+    COLD-START HANDLING: right after OTP acceptance, HPCL shows a welcome
+    bubble whose only enabled button is 'Main Menu' — Booking Services does
+    not exist yet. The recorded auth_prefix starts with 'Booking Services',
+    so a naive replay would fail with OptionNotFoundError, triggering a
+    page reload. Aggressive reloads on a fresh session kill the HPCL
+    backend session, land us back in NEEDS_OPERATOR_AUTH, and spam OTP
+    prompts in a tight loop (observed 10+ OTP prompts in under a minute
+    when the bot was first started with no cached cookies).
+
+    Fix: before running auth_prefix, inspect enabled buttons. If the first
+    auth_prefix target isn't there but Main Menu is, click Main Menu first
+    to transition from the welcome bubble into the main menu state."""
     log.info(f"playbook auth: {len(playbook.auth_prefix)} steps")
     context = {
         "operator_phone": operator_phone,
         "get_otp": get_otp,
     }
+
+    first_target = (playbook.auth_prefix[0].button_text or "").strip().lower() \
+        if playbook.auth_prefix else ""
+    if first_target:
+        snap = _read_state_snapshot(frame)
+        enabled = [(b or "").lower() for b in (snap.get("enabled") or [])]
+        has_first = any(first_target in b for b in enabled)
+        has_main_menu = any("main menu" in b for b in enabled)
+        if not has_first and has_main_menu:
+            log.info(
+                f"playbook auth: post-OTP welcome state detected "
+                f"({first_target!r} not yet visible, clicking Main Menu first)"
+            )
+            _click_by_action(
+                frame,
+                Action(kind="click", button_text="Main Menu", button_id=None),
+            )
+            chat.wait_until_settled(frame)
+
     replay_actions(frame, playbook.auth_prefix, context)
     log.info("playbook auth: done")
 
 
 def reset_to_customer_entry(frame: Frame, playbook: Playbook) -> None:
-    """Navigate the chat from ANY error state back to 'enter customer phone'.
+    """Navigate the chat from ANY state back to 'enter customer phone' with
+    the MINIMUM number of clicks. Previous incarnations blindly clicked Main
+    Menu → Booking Services → Book for Others regardless of current state,
+    which caused OptionNotFoundError storms (HPCL disables old button
+    instances within ~50ms of a click, so by the time step 2 runs the older
+    instance is gone) and triggered page reloads that eventually burned the
+    operator session.
 
-    Called between rows when the previous row ended in Issue (pending payment,
-    invalid LPG number, unknown HPCL state, etc.) — the chat is NOT sitting on
-    the customer-phone input, so we can't just re-enter booking_body.
+    The strategy here is: look at what's enabled NOW and pick the shortest
+    path. In order of preference:
 
-    Strategy: click Main Menu (HPCL puts a Main Menu button on every error
-    bubble, and _click_by_action picks the last visible enabled one), then
-    replay auth_prefix (Booking Services → Book for Others) which always
-    lands us on the customer-phone input.
+      0. READY_FOR_CUSTOMER already → no clicks needed (post-row happy path
+         when the playbook's own tail leaves us on phone input).
+      1. Book With Other Mobile enabled → click it (alt-menu escape, the
+         only button that exits that dead-end).
+      2. Book for Others enabled → click it (we're already in the sub-menu).
+      3. Booking Services enabled → click it, wait, then click Book for
+         Others (we're on the main menu).
+      4. Main Menu enabled → click it, wait, replay full auth_prefix.
 
-    Raises IframeLostError / OptionNotFoundError on click failure — the
-    caller (cli.py) is expected to fall back to full recovery (page reload
-    + full login) in that case.
+    Only Raises IframeLostError / OptionNotFoundError if NONE of the above
+    paths work — in which case the caller falls back to full recovery."""
+    try:
+        state = chat.detect_state(frame)
+    except IframeLostError:
+        state = "UNKNOWN"
+    if state == "READY_FOR_CUSTOMER":
+        log.info("playbook: already at READY_FOR_CUSTOMER; skipping reset")
+        return
+
+    snap = _read_state_snapshot(frame)
+    enabled = snap.get("enabled") or []
+    lower = [(b or "").lower() for b in enabled]
+
+    def _has(needle: str) -> bool:
+        return any(needle in b for b in lower)
+
+    if _has("book with other mobile"):
+        log.info("playbook: alt menu detected; clicking 'Book With Other Mobile'")
+        _click_by_action(
+            frame,
+            Action(kind="click", button_text="Book With Other Mobile", button_id=None),
+        )
+        chat.wait_until_settled(frame)
+        log.info("playbook: reset done (alt menu)")
+        return
+
+    if _has("book for others"):
+        log.info("playbook: 'Book for Others' already enabled; clicking direct")
+        _click_by_action(
+            frame,
+            Action(kind="click", button_text="Book for Others", button_id=None),
+        )
+        chat.wait_until_settled(frame)
+        log.info("playbook: reset done (direct Book for Others)")
+        return
+
+    if _has("booking services"):
+        log.info("playbook: at main menu; clicking Booking Services → Book for Others")
+        _click_by_action(
+            frame,
+            Action(kind="click", button_text="Booking Services", button_id=None),
+        )
+        chat.wait_until_settled(frame)
+        _click_by_action(
+            frame,
+            Action(kind="click", button_text="Book for Others", button_id=None),
+        )
+        chat.wait_until_settled(frame)
+        log.info("playbook: reset done (Booking Services → Book for Others)")
+        return
+
+    if _has("main menu"):
+        log.info("playbook: resetting via Main Menu → auth_prefix")
+        _click_by_action(
+            frame,
+            Action(kind="click", button_text="Main Menu", button_id=None),
+        )
+        chat.wait_until_settled(frame)
+        # After Main Menu click, the main menu bubble appears with Booking
+        # Services etc. If it doesn't (e.g. we were on the post-OTP welcome
+        # bubble whose only button is another Main Menu that just closes
+        # the chat), fall through to auth_prefix and let the error bubble
+        # up.
+        snap2 = _read_state_snapshot(frame)
+        enabled2 = [(b or "").lower() for b in (snap2.get("enabled") or [])]
+        first_target = (playbook.auth_prefix[0].button_text or "").strip().lower() \
+            if playbook.auth_prefix else ""
+        if first_target and not any(first_target in b for b in enabled2) \
+                and any("main menu" in b for b in enabled2):
+            log.info(
+                "playbook: still on welcome state after Main Menu click; "
+                "clicking Main Menu again"
+            )
+            _click_by_action(
+                frame,
+                Action(kind="click", button_text="Main Menu", button_id=None),
+            )
+            chat.wait_until_settled(frame)
+        replay_actions(frame, playbook.auth_prefix, {})
+        log.info("playbook: reset done (Main Menu path)")
+        return
+
+    raise OptionNotFoundError(
+        f"reset_to_customer_entry: no usable nav button; enabled={enabled}"
+    )
+
+
+def _reset_after_salvage(frame: Frame, playbook: Playbook | None) -> None:
+    """Best-effort UI reset after a salvaged Success. A salvage path means
+    the booking succeeded but the trailing nav steps (Previous Menu → Book
+    for Others) did NOT run, so the chat is stranded on a Make Payment /
+    error bubble. If we don't reset here, cli.py's post-Success branch skips
+    reset, and the NEXT row's baseline is captured from a stranded UI —
+    that's how cross-row code contamination happens.
+
+    Swallows all exceptions: we already have the salvaged code, data
+    integrity is preserved; if the reset fails, the next row's replay will
+    hit an error and cli.py will trigger full recovery.
     """
-    log.info("playbook: resetting to customer entry via Main Menu")
-    main_menu = Action(kind="click", button_text="Main Menu", button_id=None)
-    _click_by_action(frame, main_menu)
-    chat.wait_until_settled(frame)
-    replay_actions(frame, playbook.auth_prefix, {})
-    log.info("playbook: reset done")
+    if playbook is None:
+        return
+    try:
+        reset_to_customer_entry(frame, playbook)
+    except Exception as e:
+        log.warning(
+            f"post-salvage reset failed ({type(e).__name__}: {e}); "
+            f"next row will need full recovery"
+        )
 
 
 # ---- Post-failure state classification ----
@@ -457,6 +606,18 @@ _EKYC_TEXT_RE = re.compile(
     r"|refill\s+booking\s+is\s+blocked.*ekyc"
     r"|ekyc\s+is\s+pending"
     r"|complete\s+(?:aadhaar\s+)?authentication",
+    re.IGNORECASE,
+)
+_NOT_REGISTERED_TEXT_RE = re.compile(
+    r"not\s+(?:a\s+)?registered\s+(?:with\s+)?(?:hpcl|hp\s*gas)?"
+    r"|mobile\s+(?:number\s+)?is\s+not\s+registered"
+    r"|number\s+is\s+not\s+registered"
+    r"|no\s+(?:hp\s*gas\s+)?connection\s+(?:is\s+)?(?:found|linked|registered)"
+    r"|not\s+linked\s+to\s+any\s+(?:hp\s*gas|hpcl)",
+    re.IGNORECASE,
+)
+_NOT_REGISTERED_BTN_RE = re.compile(
+    r"book\s+with\s+other\s+mobile",
     re.IGNORECASE,
 )
 
@@ -524,6 +685,12 @@ def _classify_failure(
             raw=f"classifier salvage (expected click {expected_click_text!r})",
         )
 
+    if any(_NOT_REGISTERED_BTN_RE.search(b) for b in enabled) or \
+            _NOT_REGISTERED_TEXT_RE.search(text_for_search):
+        return chat.Issue(
+            reason="not_registered",
+            raw=f"enabled_buttons={enabled}; scroller_tail={text_for_search[-500:]!r}",
+        )
     if _EKYC_TEXT_RE.search(text_for_search):
         return chat.Issue(
             reason="ekyc_not_done",
@@ -656,20 +823,37 @@ def _salvage_success_from_scroller(frame: Frame, baseline: str = "") -> str | No
     except Exception as e:
         log.warning(f"_salvage_success_from_scroller read failed: {e}")
         return None
+    baseline_codes_set = set(config.SUCCESS_RE.findall(baseline))
     new_text = _post_baseline_text(full, baseline)
     m = config.SUCCESS_RE.search(new_text)
     if m:
-        return m.group(1)
-    if new_text == "":
-        baseline_codes = config.SUCCESS_RE.findall(baseline)
-        full_codes = config.SUCCESS_RE.findall(full)
-        if len(full_codes) > len(baseline_codes):
-            log.info(
-                f"salvage count-delta: baseline had {len(baseline_codes)} "
-                f"codes, scroller now has {len(full_codes)} — claiming "
-                f"newest: {full_codes[-1]}"
+        code = m.group(1)
+        # Hard defense against cross-row contamination: if this exact code
+        # was already in baseline, it's the previous row's code leaking in
+        # through a `_post_baseline_text` edge case (HPCL re-rendering,
+        # duplicate scroller trims, etc). Observed in production: row 13
+        # salvaged 719290 which belonged to row 11.
+        if code in baseline_codes_set:
+            log.warning(
+                f"salvage: code {code} already present in baseline "
+                f"(stale from prior row) — refusing to claim"
             )
-            return full_codes[-1]
+        else:
+            return code
+    if new_text == "":
+        full_codes = config.SUCCESS_RE.findall(full)
+        # Claim only codes that are STRICTLY new (not already in baseline).
+        # Previous implementation compared counts only, which allowed a
+        # code to move position within the trimmed scroller and be re-
+        # claimed as "the newest".
+        new_codes = [c for c in full_codes if c not in baseline_codes_set]
+        if new_codes:
+            log.info(
+                f"salvage count-delta: baseline had {len(baseline_codes_set)} "
+                f"unique codes, scroller now has new codes {new_codes} — "
+                f"claiming newest: {new_codes[-1]}"
+            )
+            return new_codes[-1]
     return None
 
 
@@ -694,10 +878,70 @@ def replay_booking(
     the operator can diagnose from the Issues workbook alone.
     """
     context = {"customer_phone": customer_phone}
+
+    # Precondition: the chat MUST be at READY_FOR_CUSTOMER before we type the
+    # phone. If a prior row's reset half-finished, we may be sitting on a
+    # menu screen instead — typing the customer phone there would either fall
+    # back to the textarea (now blocked by require_inline) or worse, type into
+    # a stale inline input from an earlier bubble. In either case the row gets
+    # marked failed silently and the next row inherits the broken state.
+    #
+    # Poll briefly: the customer-phone input bubble can render a beat after
+    # auth's last settle returns, especially on the first row of a batch.
+    # Only fall through to the in-place reset once we've given the page a
+    # fair chance to render the input. If that still doesn't land us on
+    # READY_FOR_CUSTOMER, raise so cli.py's recovery path takes over.
+    pre_state = "UNKNOWN"
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            pre_state = chat.detect_state(frame)
+        except IframeLostError:
+            pre_state = "UNKNOWN"
+        if pre_state == "READY_FOR_CUSTOMER":
+            break
+        time.sleep(0.5)
+    if pre_state != "READY_FOR_CUSTOMER":
+        log.warning(
+            f"replay_booking precondition: state is {pre_state!r}, not "
+            f"READY_FOR_CUSTOMER — attempting one in-place reset before typing"
+        )
+        try:
+            reset_to_customer_entry(frame, playbook)
+        except (OptionNotFoundError, ChatStuckError) as e:
+            log.warning(f"replay_booking precondition reset failed: {e}")
+            raise OptionNotFoundError(
+                f"replay_booking: cannot reach READY_FOR_CUSTOMER for "
+                f"{customer_phone[:3]}XXXXXXX (state was {pre_state!r}); "
+                f"reset failed: {e}"
+            ) from e
+        try:
+            after = chat.detect_state(frame)
+        except IframeLostError:
+            after = "UNKNOWN"
+        if after != "READY_FOR_CUSTOMER":
+            raise OptionNotFoundError(
+                f"replay_booking: post-reset state is {after!r}, expected "
+                f"READY_FOR_CUSTOMER for {customer_phone[:3]}XXXXXXX"
+            )
+
     # Baseline MUST be captured before any action runs. Every later success
     # search is restricted to text that appeared past this point, so earlier
     # rows' confirmation codes can never be attributed to this row.
     baseline = chat.full_scroller_text(frame)
+    if not baseline:
+        # Empty baseline = we cannot safely attribute any later code to THIS
+        # row. Without a baseline, SUCCESS_RE would match any prior code still
+        # sitting in the scroller and falsely credit it to this customer.
+        # Fail fast so cli.py treats this as a transient Issue and retries.
+        log.warning(
+            f"baseline_capture_failed for {customer_phone}: "
+            f"chat.full_scroller_text returned empty"
+        )
+        return chat.Issue(
+            reason="baseline_capture_failed",
+            raw="chat.full_scroller_text returned empty — cannot safely attribute success code",
+        )
     try:
         accumulated = replay_actions(frame, playbook.booking_body, context)
     except OptionNotFoundError as e:
@@ -719,6 +963,7 @@ def replay_booking(
             )
             full_now = chat.full_scroller_text(frame)
             new_text = _post_baseline_text(full_now, baseline)
+            _reset_after_salvage(frame, playbook)
             return chat.Success(code=salvaged, raw=new_text[-2000:])
 
         target_text = ""
@@ -744,19 +989,37 @@ def replay_booking(
                 chat.wait_until_settled(frame)
             except (OptionNotFoundError, ChatStuckError) as retry_e:
                 log.warning(f"post-wait click retry failed: {retry_e}")
-                return _classify_failure(frame, baseline, target_text)
-            # After the delayed click, fall through to post-baseline success
-            # detection below — the remaining recorded steps (e.g. Previous
-            # Menu, Book for Others) are nav-only and safe to skip for this
-            # row; the next row starts with its own baseline + full auth.
+                classified = _classify_failure(frame, baseline, target_text)
+                if isinstance(classified, chat.Success):
+                    _reset_after_salvage(frame, playbook)
+                return classified
+            # After the delayed click, the recorded nav steps (Previous Menu,
+            # Book for Others) did NOT run, so the UI is NOT at the
+            # customer-phone input. Run reset_to_customer_entry after a
+            # successful code detection to re-land there cleanly.
             full_now = chat.full_scroller_text(frame)
             new_text = _post_baseline_text(full_now, baseline)
+            baseline_codes_set = set(config.SUCCESS_RE.findall(baseline))
             mm = config.SUCCESS_RE.search(new_text)
             if mm:
-                return chat.Success(code=mm.group(1), raw=new_text[-2000:])
-            return _classify_failure(frame, baseline, target_text)
+                code = mm.group(1)
+                if code in baseline_codes_set:
+                    log.warning(
+                        f"post-retry: code {code} already in baseline "
+                        f"(stale from prior row) — refusing to claim"
+                    )
+                else:
+                    _reset_after_salvage(frame, playbook)
+                    return chat.Success(code=code, raw=new_text[-2000:])
+            classified = _classify_failure(frame, baseline, target_text)
+            if isinstance(classified, chat.Success):
+                _reset_after_salvage(frame, playbook)
+            return classified
 
-        return _classify_failure(frame, baseline, target_text)
+        classified = _classify_failure(frame, baseline, target_text)
+        if isinstance(classified, chat.Success):
+            _reset_after_salvage(frame, playbook)
+        return classified
     except ChatStuckError as e:
         # Wait timed out with no scroller change. HPCL sometimes renders the
         # confirmation code AFTER wait_until_settled gives up, so poll the
@@ -772,9 +1035,11 @@ def replay_booking(
             log.info(f"salvaged success after ChatStuckError: {e}")
             full_now = chat.full_scroller_text(frame)
             new_text = _post_baseline_text(full_now, baseline)
+            _reset_after_salvage(frame, playbook)
             return chat.Success(code=salvaged, raw=new_text[-2000:])
         classified = _classify_failure(frame, baseline, "")
         if isinstance(classified, chat.Success):
+            _reset_after_salvage(frame, playbook)
             return classified
         if classified.reason.startswith("unknown"):
             return chat.Issue(
@@ -792,6 +1057,7 @@ def replay_booking(
             )
             full_now = chat.full_scroller_text(frame)
             new_text = _post_baseline_text(full_now, baseline)
+            _reset_after_salvage(frame, playbook)
             return chat.Success(code=salvaged, raw=new_text[-2000:])
         # Transient — re-raise so cli.py can recover and retry.
         raise
@@ -800,9 +1066,33 @@ def replay_booking(
     # appeared since baseline.
     full = chat.full_scroller_text(frame)
     new_text = _post_baseline_text(full, baseline)
+    baseline_codes_set = set(config.SUCCESS_RE.findall(baseline))
     m = config.SUCCESS_RE.search(new_text)
     if m:
-        return chat.Success(code=m.group(1), raw=new_text[-2000:])
+        code = m.group(1)
+        # Final guard against cross-row contamination: the happy-path slice
+        # should never contain a code that was already in baseline. If it
+        # does, _post_baseline_text mis-sliced (HPCL trim edge case) and we
+        # must not falsely credit this row with the prior row's code.
+        if code not in baseline_codes_set:
+            return chat.Success(code=code, raw=new_text[-2000:])
+        log.warning(
+            f"happy path: code {code} already in baseline "
+            f"(stale from prior row) — refusing to claim"
+        )
+
+    # No success code: run the state classifier. For unregistered numbers, all
+    # 4 replay clicks succeed (HPCL reuses Yes/Previous Menu/Book for Others ids
+    # across rows and the JS click-by-id still finds enabled matches in the
+    # scroller), but no booking is created — we must inspect the resulting
+    # scroller state so rows like "not registered" get a terminal tag instead
+    # of looping forever as transient playbook_no_success_code.
+    classified = _classify_failure(frame, baseline, "")
+    if isinstance(classified, chat.Success):
+        _reset_after_salvage(frame, playbook)
+        return classified
+    if not classified.reason.startswith("unknown"):
+        return classified
 
     return chat.Issue(
         reason="playbook_no_success_code",

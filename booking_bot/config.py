@@ -7,12 +7,12 @@ import sys
 from pathlib import Path
 
 # ---- Paths ----
-# When running from source, ROOT is the repo root.
-# When running from a PyInstaller bundle, ROOT is the dir containing the
-# .exe so that Output/, Issues/, and logs/ land next to the binary — users
-# expect their outputs alongside the program, not buried inside _internal/.
-# RESOURCES_ROOT points at the bundle extraction dir (sys._MEIPASS) in
-# frozen mode so we can still find bundled recordings/.
+# When running from source, ROOT is the repo root. When running from a
+# PyInstaller bundle (single .exe), ROOT is the dir containing the .exe so
+# Output/, Issues/, logs/, and .chrome-profile/ land next to the binary
+# rather than inside the temp extraction dir (which PyInstaller wipes on
+# exit and would lose all state). RESOURCES_ROOT points at the bundle's
+# _MEIPASS extraction dir so we can still read bundled recordings/.
 if getattr(sys, "frozen", False):
     ROOT           = Path(sys.executable).resolve().parent
     RESOURCES_ROOT = Path(getattr(sys, "_MEIPASS", ROOT))
@@ -33,22 +33,63 @@ URL = (
     "https://hpchatbot.hpcl.co.in/pwa/view?data="
     "eyJlSWQiOjEwMCwiZ2xpIjp0cnVlLCJjYW1wYWlnbklkIjoiNjQ1MjAyZTNhMTdlMTZhY2RlOTNhMjhmIiwibGkiOiI4OWJiNzZlYTZlNmY0OTVjOTAwNTc3M2I1MGEzNDMyMSJ9"
 )
-OPERATOR_PHONE = "XXXXXXXXXX"   # 10-digit number registered with HP Gas for
-                                # OTP auth. Overridden at runtime by the
-                                # startup dialog when the .exe is launched
-                                # without CLI args; set here as a fallback
-                                # for developers running from source.
+OPERATOR_PHONE = "9209114429"   # operator edits this to their own number
 
 # ---- Timing (seconds unless suffixed _MS) ----
-PAGE_LOAD_WAIT_S      = 4
-SETTLE_QUIET_MS       = 1500
+# Tuned 2026-04-14 for throughput: original values were PACING_S=4.5 and
+# SETTLE_QUIET_MS=1500. wait_until_settled already blocks until the loader
+# disappears, so PACING_S is pure inter-booking padding — dropped to 1.5s.
+# SETTLE_QUIET_MS was dropped to 800ms; HPCL's trailing bubbles almost always
+# arrive within the first 500ms after the loader goes away.
+PAGE_LOAD_WAIT_S      = 3
+SETTLE_QUIET_MS       = 800
 STUCK_THRESHOLD_S     = 60
-PACING_S              = 4.5
+PACING_S              = 1.5
 RETRY_PAUSE_S         = 2
 GET_FRAME_TIMEOUT_S   = 30
 MAX_NAV_HOPS          = 6
 MAX_STEPS_PER_BOOKING = 5
 MAX_ATTEMPTS_PER_ROW  = 2
+
+# ---- Gateway recovery backoff ----
+# Wait this long after a GatewayError for HPCL's upstream to recover before
+# attempting any recovery action. Reloading into an ongoing 502 burst
+# destroys the session and forces a full operator re-auth (the OTP flood
+# pattern). A 20s quiesce is enough for most transient gateway flaps.
+GATEWAY_QUIESCE_S     = 20
+# If we DO need to reload and the reload itself hits a gateway error, wait
+# this much longer before the next reload attempt. Prevents tight reload
+# loops through a flapping gateway.
+GATEWAY_RELOAD_WAIT_S = 45
+# When the chat state comes back as NEEDS_OPERATOR_AUTH within this many
+# seconds of a successful auth, treat it as suspect — HPCL's PWA sometimes
+# flashes the login screen briefly during a reload even though the session
+# is still server-side valid. We re-check once before prompting the operator
+# for an OTP they just typed.
+RECENT_AUTH_WINDOW_S  = 90
+RECENT_AUTH_RECHECK_S = 15
+
+# ---- Circuit breakers (added 2026-04-14 after the OTP-flood incident) ----
+# These hard limits stop the bot from repeating the same failure forever
+# rather than skipping rows endlessly when HPCL is in a sustained outage.
+#
+# MAX_CONSECUTIVE_ROW_FAILURES: abort the batch after this many rows in a
+# row end in recovery_failed / recovered_but_failed. A single bad row is
+# fine; ten in a row means we're stuck in a 502 cascade and nothing we
+# do is helping. The operator should rerun later when HPCL recovers.
+MAX_CONSECUTIVE_ROW_FAILURES = 5
+# MAX_CONSECUTIVE_REAUTHS: how many times in a row login_if_needed is
+# allowed to detect NEEDS_OPERATOR_AUTH within RECENT_AUTH_WINDOW_S of a
+# previous successful auth before we abort. The recent-auth recheck is
+# our first line of defence; this is the second, in case the session
+# really is being destroyed every reload and prompting more OTPs would
+# burn through the operator's daily quota for nothing.
+MAX_CONSECUTIVE_REAUTHS      = 3
+# IN_PLACE_POLL_S: how long recover_session / _recover_with_playbook
+# should keep polling the in-place frame for a non-UNKNOWN state before
+# falling back to a full page reload. Larger values mean more chances to
+# avoid a session-destroying reload during a transient flap.
+IN_PLACE_POLL_S              = 30
 
 # ---- DOM selectors ----
 OUTER_IFRAME_SEL = "iframe#webform"
@@ -77,8 +118,7 @@ AFFIRMATIVE_LABELS = _compile_list([
 ])
 
 AUTH_NAV_SEQUENCE = [
-    _compile_list([r"^main\s+menu$", r"main\s+menu"]),
-    _compile_list([r"booking\s+services", r"refill", r"book\s+cylinder"]),
+    _compile_list([r"booking\s+services", r"refill"]),
     _compile_list([r"book\s+for\s+others", r"for\s+others"]),
 ]
 

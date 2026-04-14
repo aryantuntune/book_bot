@@ -6,6 +6,7 @@ get_chat_frame, Task 12 adds the gateway listener, Task 19 adds recover_session.
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from typing import Callable
 
@@ -20,12 +21,30 @@ from playwright.sync_api import (
 )
 
 from booking_bot import config
-from booking_bot.exceptions import GatewayError, IframeLostError
+from booking_bot.exceptions import (
+    ChromeNotInstalledError,
+    GatewayError,
+    IframeLostError,
+)
 
 log = logging.getLogger("browser")
 
 # Module-level state for the gateway listener (Task 12). One-process bot.
 _gateway_error_seen = False
+
+# Timestamp of the last successful operator auth. Used by auth.login_if_needed
+# to detect bogus NEEDS_OPERATOR_AUTH flashes that sometimes follow a reload
+# through a flapping gateway — if we authed less than RECENT_AUTH_WINDOW_S ago
+# and suddenly see the login screen, we re-check before prompting the operator.
+_last_auth_at_monotonic: float | None = None
+
+# Counter for the OTP-flood circuit breaker. Incremented each time
+# login_if_needed sees NEEDS_OPERATOR_AUTH within RECENT_AUTH_WINDOW_S
+# of the previous successful auth AND the recheck still shows it. Reset
+# whenever cli.py finishes a row without entering the recovery path.
+# Once it hits config.MAX_CONSECUTIVE_REAUTHS we abort the batch instead
+# of looping OTP prompts at the operator forever.
+_consecutive_rapid_reauths: int = 0
 
 
 def reset_gateway_flag() -> None:
@@ -37,12 +56,53 @@ def gateway_flag() -> bool:
     return _gateway_error_seen
 
 
+def mark_auth_success() -> None:
+    """Record that the operator is currently authenticated. Called by
+    auth.login_if_needed whenever it confirms a logged-in state (whether
+    it typed credentials or found the session already alive)."""
+    global _last_auth_at_monotonic
+    _last_auth_at_monotonic = time.monotonic()
+
+
+def last_auth_age_s() -> float | None:
+    """Seconds since the last mark_auth_success() call, or None if we've
+    never authed in this process."""
+    if _last_auth_at_monotonic is None:
+        return None
+    return time.monotonic() - _last_auth_at_monotonic
+
+
+def note_rapid_reauth() -> int:
+    """Increment and return the rapid-reauth counter. Called by
+    auth.login_if_needed when the recent-auth recheck still shows
+    NEEDS_OPERATOR_AUTH — the operator just typed an OTP, we accepted
+    it, and the chat is already back on the login screen. That's a
+    sign that whatever we're doing (probably a reload) is destroying
+    the session and the OTP flood is about to start."""
+    global _consecutive_rapid_reauths
+    _consecutive_rapid_reauths += 1
+    return _consecutive_rapid_reauths
+
+
+def reset_rapid_reauth_counter() -> None:
+    """Clear the rapid-reauth counter. Called by cli.py after each row
+    that completes WITHOUT entering the recovery path — proof that the
+    session is healthy again."""
+    global _consecutive_rapid_reauths
+    _consecutive_rapid_reauths = 0
+
+
+def rapid_reauth_count() -> int:
+    return _consecutive_rapid_reauths
+
+
 PROFILE_DIR_NAME = ".chrome-profile"
+CHROMIUM_PROFILE_DIR_NAME = ".chromium-profile"
 
 
 def start_browser(
     headless: bool = False,
-    use_system_chrome: bool = True,
+    use_system_chrome: bool = False,
 ) -> tuple[Playwright, Browser | None, BrowserContext, Page]:
     """Launch Chromium against a persistent user-data dir so that cookies,
     local storage, and service-worker caches survive across runs. This
@@ -54,18 +114,19 @@ def start_browser(
         runs are reused. Suitable for scripted / background execution
         via --headless.
 
-    use_system_chrome: when True (default for the shareable .exe),
-        Playwright launches the operator's installed Google Chrome via
-        channel="chrome" instead of a bundled Chromium binary. This
-        drops ~345 MB from the PyInstaller bundle but requires Chrome
-        to be installed on the target machine.
+    use_system_chrome: when False (default for the shareable .exe), the
+        bundled Chromium 1134 is used. When True, Playwright launches the
+        operator's installed Google Chrome via channel="chrome" instead.
+        Bundled Chromium adds ~345 MB to the PyInstaller bundle but is
+        the only browser whose persistent user-data dir reliably survives
+        across runs on client machines, so we default to it.
 
     Returns (pw, None, ctx, page). The Browser slot is None because
     launch_persistent_context gives back a BrowserContext directly.
     Callers must close ctx and stop pw at shutdown.
 
-    Profile dir lives at config.ROOT / .chrome-profile — next to the
-    .exe in frozen mode, at the repo root when running from source.
+    Profile dir lives at config.ROOT / <name> — next to the .exe in
+    frozen mode, at the repo root when running from source.
 
     Does NOT pre-reload. The reload-on-missing-chat logic lives in
     get_chat_frame — only reload once we've confirmed the chat hasn't
@@ -74,7 +135,8 @@ def start_browser(
     same half-initialized state).
     """
     pw = sync_playwright().start()
-    profile_dir = config.ROOT / PROFILE_DIR_NAME
+    profile_name = PROFILE_DIR_NAME if use_system_chrome else CHROMIUM_PROFILE_DIR_NAME
+    profile_dir = config.ROOT / profile_name
     profile_dir.mkdir(parents=True, exist_ok=True)
     launch_kwargs: dict = {
         "user_data_dir": str(profile_dir),
@@ -88,7 +150,32 @@ def start_browser(
     }
     if use_system_chrome:
         launch_kwargs["channel"] = "chrome"
-    ctx = pw.chromium.launch_persistent_context(**launch_kwargs)
+    try:
+        ctx = pw.chromium.launch_persistent_context(**launch_kwargs)
+    except Exception as launch_err:
+        msg = str(launch_err)
+        # Playwright's error when Chrome/Chromium can't be found mentions
+        # "Executable doesn't exist" and a chromium-1134 path. Re-raise as
+        # a ChromeNotInstalledError with a download link so the GUI bootstrap
+        # can show the operator a clear, actionable dialog instead of a
+        # cryptic Playwright traceback.
+        if use_system_chrome and (
+            "Executable doesn't exist" in msg
+            or "chromium-1134" in msg
+            or "channel" in msg.lower()
+        ):
+            try:
+                pw.stop()
+            except Exception:
+                pass
+            raise ChromeNotInstalledError(
+                "Google Chrome is not installed on this computer.\n\n"
+                "The HP Gas Booking Bot uses your installed Chrome to talk\n"
+                "to HPCL. Please install Chrome from:\n\n"
+                "    https://www.google.com/chrome/\n\n"
+                "then launch the bot again."
+            ) from launch_err
+        raise
     # launch_persistent_context opens one blank tab by default — reuse it.
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     mode = "headless" if headless else "headed"
@@ -202,18 +289,75 @@ def install_gateway_listener(page: Page) -> None:
     page.on("framenavigated", _on_framenav)
 
 
+def _try_in_place_frame(page: Page) -> Frame | None:
+    """Return the current main frame if the chat scroller is still rendered
+    and detect_state reports a known state. Return None if the frame is
+    broken or the state is UNKNOWN even after polling — the caller should
+    reload in that case.
+
+    Polls for up to config.IN_PLACE_POLL_S seconds before giving up.
+    Reloads are session-destroying when HPCL is mid-flap; staying in place
+    and waiting is almost always cheaper than a reload + re-auth, so we
+    poll hard before falling back.
+
+    Used by recover_session to avoid a full page.reload() on transient
+    single-request 502s, which is what historically destroyed the session
+    and triggered repeated OTP prompts.
+    """
+    from booking_bot import chat  # late import — chat depends on browser
+    deadline = time.monotonic() + config.IN_PLACE_POLL_S
+    poll_interval_s = 1.0
+    last_state = "UNKNOWN"
+    while time.monotonic() < deadline:
+        try:
+            if not _scroller_populated(page):
+                last_state = "<empty>"
+            else:
+                frame = page.main_frame
+                state = chat.detect_state(frame)
+                last_state = state
+                if state != "UNKNOWN":
+                    log.info(
+                        f"recover_session: in-place state={state!r}; "
+                        f"skipping reload"
+                    )
+                    return frame
+        except Exception as e:
+            log.debug(
+                f"recover_session: in-place poll error: "
+                f"{type(e).__name__}: {e}"
+            )
+        time.sleep(poll_interval_s)
+    log.info(
+        f"recover_session: in-place gave up after "
+        f"{config.IN_PLACE_POLL_S}s (last={last_state!r})"
+    )
+    return None
+
+
 def recover_session(
     page: Page,
     operator_phone: str,
     get_otp: Callable[[], str],
 ) -> Frame:
-    """Attempt to recover a wedged/erroring chat session. The server-side
-    session typically survives the reload — we only re-run operator auth if
-    detect_state sees NEEDS_OPERATOR_AUTH. Navigation-first, re-auth as a
-    last resort.
+    """Attempt to recover a wedged/erroring chat session.
+
+    Recovery strategy (gateway-aware, added after the OTP-flood incident):
+
+      1. Wait GATEWAY_QUIESCE_S for HPCL's upstream to recover. Reloading
+         into an ongoing 502 burst is what caused the bot to reload, hit a
+         second 502, lose its session, and prompt for OTP on every row.
+      2. Try to detect state on the CURRENT page. If the frame is still
+         alive and reports a recognised state (MAIN_MENU, BOOK_FOR_OTHERS_
+         MENU, READY_FOR_CUSTOMER, etc.), skip the reload entirely. This
+         is the fast path for transient single-request 502s.
+      3. Only if the in-place read fails (IframeLostError / UNKNOWN /
+         detection throws) do we fall back to page.reload(). If the reload
+         itself trips the gateway flag, wait GATEWAY_RELOAD_WAIT_S before
+         letting the caller retry.
 
     Raises:
-      GatewayError if the reload itself times out.
+      GatewayError if the reload itself times out or also hits a 502.
       FatalError if detect_state returns UNKNOWN (unrecognized page).
       ChatStuckError if we exceed MAX_NAV_HOPS without reaching
         READY_FOR_CUSTOMER.
@@ -222,14 +366,29 @@ def recover_session(
     from booking_bot import auth, chat
     from booking_bot.exceptions import FatalError
 
-    log.warning("recover_session: reloading page")
-    try:
-        page.reload(wait_until="domcontentloaded", timeout=60_000)
-    except PWTimeoutError as e:
-        raise GatewayError(f"reload timed out: {e}") from e
-    page.wait_for_timeout(config.PAGE_LOAD_WAIT_S * 1000)
+    log.warning(
+        f"recover_session: waiting {config.GATEWAY_QUIESCE_S}s for gateway "
+        f"to quiesce before attempting recovery"
+    )
+    reset_gateway_flag()
+    time.sleep(config.GATEWAY_QUIESCE_S)
 
-    frame = get_chat_frame(page)
+    frame = _try_in_place_frame(page)
+    if frame is None:
+        log.warning("recover_session: in-place frame unusable; reloading page")
+        reset_gateway_flag()
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=60_000)
+        except PWTimeoutError as e:
+            raise GatewayError(f"reload timed out: {e}") from e
+        page.wait_for_timeout(config.PAGE_LOAD_WAIT_S * 1000)
+        if gateway_flag():
+            log.warning(
+                f"recover_session: reload hit gateway error; waiting "
+                f"{config.GATEWAY_RELOAD_WAIT_S}s before surfacing failure"
+            )
+            time.sleep(config.GATEWAY_RELOAD_WAIT_S)
+        frame = get_chat_frame(page)
     chat.wait_until_settled(frame)
 
     for hop in range(config.MAX_NAV_HOPS):

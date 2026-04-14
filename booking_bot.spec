@@ -1,28 +1,54 @@
-# PyInstaller spec for booking_bot. Builds a single shareable .exe that
-# drives the operator's installed Google Chrome via Playwright
-# (channel="chrome") — so we do NOT bundle chromium-1134 or ffmpeg-1010.
-# Only the ~78 MB Playwright node-based driver is embedded. The resulting
-# one-file .exe is small enough to share via WhatsApp.
+# PyInstaller spec for booking_bot. Builds a single shareable .exe with
+# bundled Chromium 1134 + ffmpeg 1010 + the Playwright driver, so the bot
+# does NOT depend on the operator having Google Chrome installed.
 #
-# Usage (from repo root, after `pip install -r requirements-build.txt`):
+# Why bundled Chromium (not channel="chrome"):
+#   1. Real client laptops have flaky Chrome installs that don't preserve
+#      Playwright's persistent user-data dir across runs, which causes the
+#      session cookie to drop and the bot to ask for an OTP on every row.
+#      Bundled Chromium with .chromium-profile/ next to the .exe survives
+#      restarts cleanly.
+#   2. Removes the "install Google Chrome first" requirement entirely.
+#
+# Trade-off: the .exe grows from ~65 MB to ~450-500 MB. Too big for the
+# old WhatsApp 100 MB cap but fits the modern 2 GB cap; otherwise share
+# via Drive / USB.
+#
+# Usage (from repo root, after `pip install -r requirements-build.txt`
+# and `python -m playwright install chromium`):
 #
 #     python -m PyInstaller booking_bot.spec --clean --noconfirm
 #
-# Output: dist/booking_bot.exe — a single file, ship it as-is.
+# Output: dist/booking_bot.exe — a single self-extracting file.
 #
 # Runtime behavior:
-#   - Double-click: headed Chrome + a new console window showing live logs.
-#   - `booking_bot.exe --headless`: no Chrome window, no new console,
+#   - Double-click: headed Chromium + a new console window showing live logs.
+#   - `booking_bot.exe --headless`: no Chromium window, no new console,
 #     attaches to the parent cmd.exe only if the user is already in one.
-#     Requires a previously-established session in .chrome-profile/.
+#     Requires a previously-established session in .chromium-profile/.
 
+import os
 from pathlib import Path
+
+# ---- Locate the playwright browser cache --------------------------------
+# playwright 1.47 pins chromium-1134 and ffmpeg-1010. We bundle both into
+# ms-playwright/ inside the bundle; at runtime, _pyi_bootstrap sets
+# PLAYWRIGHT_BROWSERS_PATH to that dir so the driver finds them.
+local_appdata = os.environ.get("LOCALAPPDATA", "")
+pw_cache = Path(local_appdata) / "ms-playwright"
+chromium_src = pw_cache / "chromium-1134"
+ffmpeg_src   = pw_cache / "ffmpeg-1010"
+
+for src in (chromium_src, ffmpeg_src):
+    if not src.exists():
+        raise SystemExit(
+            f"Missing playwright browser cache: {src}\n"
+            "Run `python -m playwright install chromium` first."
+        )
 
 # ---- Locate the playwright driver ---------------------------------------
 # The driver (node.exe + package/ dir) lives inside site-packages/playwright
-# and must be shipped intact or playwright.sync_api won't start. This is the
-# only piece of Playwright we still bundle — chromium itself comes from the
-# operator's installed Chrome.
+# and must be shipped intact or playwright.sync_api won't start.
 import playwright
 pw_pkg_dir = Path(playwright.__file__).resolve().parent
 pw_driver_src = pw_pkg_dir / "driver"
@@ -36,6 +62,8 @@ repo_root = Path(SPECPATH).resolve()  # noqa: F821 — SPECPATH is PyInstaller-i
 recordings_dir = repo_root / "recordings"
 
 datas = [
+    (str(chromium_src), "ms-playwright/chromium-1134"),
+    (str(ffmpeg_src),   "ms-playwright/ffmpeg-1010"),
     (str(pw_driver_src), "playwright/driver"),
 ]
 if recordings_dir.exists():
