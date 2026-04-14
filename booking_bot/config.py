@@ -80,17 +80,22 @@ RECENT_AUTH_RECHECK_S = 15
 MAX_CONSECUTIVE_ROW_FAILURES = 5
 # MAX_CONSECUTIVE_REAUTHS: how many times in a row login_if_needed is
 # allowed to detect NEEDS_OPERATOR_AUTH within RECENT_AUTH_WINDOW_S of a
-# previous successful auth before we abort. Lowered from 3 to 1 on
-# 2026-04-15: the operator cannot disturb their HPCL client for a fresh
-# OTP every time a transient gateway flap flashes the login screen. On
-# the FIRST rapid-reauth detection we now raise RestartableFatalError,
-# which triggers an in-process browser restart. The persistent chrome
-# profile retains the session cookies, so the relaunch almost always
-# lands on a live post-auth state without any operator intervention.
-# If cookies are ALSO dead, the new process starts with
-# last_auth_age_s()=None so the recent-auth guard skips and we fall
-# through to a legitimate one-time OTP prompt — no restart loop.
-MAX_CONSECUTIVE_REAUTHS      = 1
+# previous successful auth before we abort. The recent-auth recheck is
+# our first line of defence; this is the second, in case the session
+# really is being destroyed every reload and prompting more OTPs would
+# burn through the operator's daily quota for nothing.
+#
+# 2026-04-15: briefly lowered to 1 during investigation of the OTP flood,
+# then reverted to 3 after the operator reported that the aggressive
+# setting made session recovery WORSE: at 1, the very first auth flash
+# triggered a full browser restart, and the new process lost the
+# in-memory `_last_auth_at_monotonic` timestamp — so the recent-auth
+# guard no longer fired on the new process, and the bot fell through to
+# prompting for a fresh OTP. Net effect: lost the live session on every
+# gateway hiccup. With 3, the first 2 rapid re-auths stay in-process
+# (type phone + OTP, session re-established, counter resets) and only a
+# sustained cascade of 3 triggers the browser restart.
+MAX_CONSECUTIVE_REAUTHS      = 3
 # IN_PLACE_POLL_S: how long recover_session / _recover_with_playbook
 # should keep polling the in-place frame for a non-UNKNOWN state before
 # falling back to a full page reload. Larger values mean more chances to
@@ -111,12 +116,9 @@ AUTO_RESTART_WAIT_S          = 30
 # When the bot is blocked on a manual input (OTP prompt, --keep-open pause)
 # for more than IDLE_ALERT_AFTER_S, start beeping the device every
 # IDLE_ALERT_INTERVAL_S until the input is received. Prevents the operator
-# from missing a stuck bot that's silently waiting on a dialog. Lowered
-# from 120s to 30s on 2026-04-15 after the operator missed an OTP prompt
-# that fired at the 99-second mark — the old threshold was too slow to
-# catch real-world blocks.
-IDLE_ALERT_AFTER_S           = 30
-IDLE_ALERT_INTERVAL_S        = 15
+# from missing a stuck bot that's silently waiting on a dialog.
+IDLE_ALERT_AFTER_S           = 120
+IDLE_ALERT_INTERVAL_S        = 30
 
 # ---- DOM selectors ----
 OUTER_IFRAME_SEL = "iframe#webform"
