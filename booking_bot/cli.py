@@ -115,20 +115,26 @@ def _resolve_playbook_path(explicit: Path | None, no_playbook: bool) -> Path | N
         if not explicit.exists():
             raise SystemExit(f"--playbook path does not exist: {explicit}")
         return explicit
-    recordings_dir = config.ROOT / "recordings"
-    if not recordings_dir.exists():
-        return None
-    candidates = sorted(
-        recordings_dir.glob("*.jsonl"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+    # Search two locations so the frozen .exe finds both operator-added
+    # recordings (dropped next to the binary) AND the build-time fallback
+    # PyInstaller extracts into _MEIPASS. config.ROOT = exe dir in frozen
+    # mode, RESOURCES_ROOT = _MEIPASS. When running from source both point
+    # at the repo root, so the second entry is harmless.
+    search_dirs: list[Path] = []
+    for d in (config.ROOT / "recordings", config.RESOURCES_ROOT / "recordings"):
+        if d not in search_dirs:
+            search_dirs.append(d)
+    candidates: list[Path] = []
+    for d in search_dirs:
+        if d.exists():
+            candidates.extend(d.glob("*.jsonl"))
     if not candidates:
         return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     newest = candidates[0]
     log.info(
         f"auto-selected newest recording: {newest.name} "
-        f"({len(candidates)} available in recordings/)"
+        f"({len(candidates)} available across {len(search_dirs)} location(s))"
     )
     return newest
 
