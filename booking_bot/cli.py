@@ -391,6 +391,24 @@ def main() -> None:
     log.info("booking_bot done")
 
 
+def _session_dead_cleanup_has_retriable_rows(store) -> tuple[bool, int]:
+    """Section 5 of the survivability design. Called after the 30-min quiet
+    retry loop has given up waiting for HPCL's session to heal.
+
+    Returns (has_retriable, pending_count):
+      - has_retriable=False, pending_count=0 -> the batch drained to zero
+        during the retry loop. Nothing a fresh OTP would unblock. Caller
+        should exit cleanly without alarming the operator.
+      - has_retriable=True,  pending_count=N -> N rows still need work.
+        Every pending row is retriable (attempt_count < MAX_ATTEMPTS_PER_ROW
+        by the Section 4 invariant — capped rows have col C='ISSUE' and
+        never appear in pending_rows). Caller should fire the loud idle
+        alarm and prompt the operator for a fresh OTP.
+    """
+    pending = list(store.pending_rows())
+    return (len(pending) > 0, len(pending))
+
+
 def _run_session_attempt(store, args, pb, pre_handles) -> None:
     """Run one browser session: launch (or reuse pre-launched handles),
     authenticate, process pending rows, close the browser. Called by
