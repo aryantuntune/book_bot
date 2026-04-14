@@ -5,9 +5,13 @@ get_chat_frame, Task 12 adds the gateway listener, Task 19 adds recover_session.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import sys
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable
 
 from playwright.sync_api import (
@@ -32,19 +36,9 @@ log = logging.getLogger("browser")
 # Module-level state for the gateway listener (Task 12). One-process bot.
 _gateway_error_seen = False
 
-# Timestamp of the last successful operator auth. Used by auth.login_if_needed
-# to detect bogus NEEDS_OPERATOR_AUTH flashes that sometimes follow a reload
-# through a flapping gateway — if we authed less than RECENT_AUTH_WINDOW_S ago
-# and suddenly see the login screen, we re-check before prompting the operator.
-_last_auth_at_monotonic: float | None = None
-
-# Counter for the OTP-flood circuit breaker. Incremented each time
-# login_if_needed sees NEEDS_OPERATOR_AUTH within RECENT_AUTH_WINDOW_S
-# of the previous successful auth AND the recheck still shows it. Reset
-# whenever cli.py finishes a row without entering the recovery path.
-# Once it hits config.MAX_CONSECUTIVE_REAUTHS we abort the batch instead
-# of looping OTP prompts at the operator forever.
-_consecutive_rapid_reauths: int = 0
+PROFILE_DIR_NAME = ".chrome-profile"
+CHROMIUM_PROFILE_DIR_NAME = ".chromium-profile"
+_LAST_AUTH_FILENAME = "last_auth.json"
 
 
 def reset_gateway_flag() -> None:
@@ -56,48 +50,66 @@ def gateway_flag() -> bool:
     return _gateway_error_seen
 
 
+# Section 1 of the survivability design: we persist the last successful
+# auth timestamp to disk so an auto-restart (or a manual rerun) doesn't
+# forget that we just typed an OTP. Wall-clock UTC — monotonic would
+# reset on reboot and the only consumer is a cooldown check where
+# wall-clock is exactly right.
+
+
+def _last_auth_path() -> Path:
+    """Disk location of the auth timestamp file. Lives inside the same
+    persistent profile dir as the chrome cookies so wiping the profile
+    also wipes the cooldown in one shot. Resolved lazily because
+    config.ROOT is read-through and tests monkeypatch it."""
+    return Path(config.ROOT) / CHROMIUM_PROFILE_DIR_NAME / _LAST_AUTH_FILENAME
+
+
 def mark_auth_success() -> None:
-    """Record that the operator is currently authenticated. Called by
-    auth.login_if_needed whenever it confirms a logged-in state (whether
-    it typed credentials or found the session already alive)."""
-    global _last_auth_at_monotonic
-    _last_auth_at_monotonic = time.monotonic()
+    """Record that the operator is currently authenticated. Writes
+    atomically via <path>.tmp + os.replace so a crash mid-write can't
+    produce a corrupt JSON that breaks subsequent runs."""
+    path = _last_auth_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"auth_at_utc": datetime.now(timezone.utc).isoformat()}
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload))
+    os.replace(tmp, path)
 
 
 def last_auth_age_s() -> float | None:
     """Seconds since the last mark_auth_success() call, or None if we've
-    never authed in this process."""
-    if _last_auth_at_monotonic is None:
+    never authed or the file is missing/unreadable. A corrupt or
+    future-dated file is treated as 'never authed' — better to prompt
+    once for OTP than to trust garbage."""
+    path = _last_auth_path()
+    if not path.exists():
         return None
-    return time.monotonic() - _last_auth_at_monotonic
+    try:
+        payload = json.loads(path.read_text())
+        then = datetime.fromisoformat(payload["auth_at_utc"])
+        now = datetime.now(timezone.utc)
+        age = (now - then).total_seconds()
+        if age < 0:
+            return None
+        return age
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None
 
 
-def note_rapid_reauth() -> int:
-    """Increment and return the rapid-reauth counter. Called by
-    auth.login_if_needed when the recent-auth recheck still shows
-    NEEDS_OPERATOR_AUTH — the operator just typed an OTP, we accepted
-    it, and the chat is already back on the login screen. That's a
-    sign that whatever we're doing (probably a reload) is destroying
-    the session and the OTP flood is about to start."""
-    global _consecutive_rapid_reauths
-    _consecutive_rapid_reauths += 1
-    return _consecutive_rapid_reauths
-
-
-def reset_rapid_reauth_counter() -> None:
-    """Clear the rapid-reauth counter. Called by cli.py after each row
-    that completes WITHOUT entering the recovery path — proof that the
-    session is healthy again."""
-    global _consecutive_rapid_reauths
-    _consecutive_rapid_reauths = 0
-
-
-def rapid_reauth_count() -> int:
-    return _consecutive_rapid_reauths
-
-
-PROFILE_DIR_NAME = ".chrome-profile"
-CHROMIUM_PROFILE_DIR_NAME = ".chromium-profile"
+def clear_auth_cooldown() -> None:
+    """Delete the persisted auth timestamp so the next login_if_needed
+    call will accept a phone/OTP submission. Called ONLY from the
+    Section 5 session-dead path where the operator has explicitly been
+    alarmed and the bot needs to accept a fresh OTP even though less
+    than AUTH_COOLDOWN_S has elapsed since the last successful auth."""
+    path = _last_auth_path()
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log.warning(f"clear_auth_cooldown: could not delete {path}: {e}")
 
 
 def start_browser(

@@ -65,14 +65,6 @@ GATEWAY_QUIESCE_S     = 20
 # this much longer before the next reload attempt. Prevents tight reload
 # loops through a flapping gateway.
 GATEWAY_RELOAD_WAIT_S = 45
-# When the chat state comes back as NEEDS_OPERATOR_AUTH within this many
-# seconds of a successful auth, treat it as suspect — HPCL's PWA sometimes
-# flashes the login screen briefly during a reload even though the session
-# is still server-side valid. We re-check once before prompting the operator
-# for an OTP they just typed.
-RECENT_AUTH_WINDOW_S  = 90
-RECENT_AUTH_RECHECK_S = 15
-
 # ---- Circuit breakers (added 2026-04-14 after the OTP-flood incident) ----
 # These hard limits stop the bot from repeating the same failure forever
 # rather than skipping rows endlessly when HPCL is in a sustained outage.
@@ -82,24 +74,14 @@ RECENT_AUTH_RECHECK_S = 15
 # fine; ten in a row means we're stuck in a 502 cascade and nothing we
 # do is helping. The operator should rerun later when HPCL recovers.
 MAX_CONSECUTIVE_ROW_FAILURES = 5
-# MAX_CONSECUTIVE_REAUTHS: how many times in a row login_if_needed is
-# allowed to detect NEEDS_OPERATOR_AUTH within RECENT_AUTH_WINDOW_S of a
-# previous successful auth before we abort. The recent-auth recheck is
-# our first line of defence; this is the second, in case the session
-# really is being destroyed every reload and prompting more OTPs would
-# burn through the operator's daily quota for nothing.
-#
-# 2026-04-15: briefly lowered to 1 during investigation of the OTP flood,
-# then reverted to 3 after the operator reported that the aggressive
-# setting made session recovery WORSE: at 1, the very first auth flash
-# triggered a full browser restart, and the new process lost the
-# in-memory `_last_auth_at_monotonic` timestamp — so the recent-auth
-# guard no longer fired on the new process, and the bot fell through to
-# prompting for a fresh OTP. Net effect: lost the live session on every
-# gateway hiccup. With 3, the first 2 rapid re-auths stay in-process
-# (type phone + OTP, session re-established, counter resets) and only a
-# sustained cascade of 3 triggers the browser restart.
-MAX_CONSECUTIVE_REAUTHS      = 3
+# AUTH_COOLDOWN_S (Section 1 of the survivability design): the bot is
+# allowed to type the operator phone number at most once per this window.
+# The timestamp lives at .chromium-profile/last_auth.json and survives
+# process restarts, so a full day of 100+ gateway flaps triggers at most
+# one real OTP SMS. Any NEEDS_OPERATOR_AUTH detection inside the cooldown
+# window is routed through Section 3's quiet retry loop instead of
+# typing the phone (which would burn operator OTP quota for nothing).
+AUTH_COOLDOWN_S              = 10800   # 3h
 # IN_PLACE_POLL_S: how long recover_session / _recover_with_playbook
 # should keep polling the in-place frame for a non-UNKNOWN state before
 # falling back to a full page reload. Larger values mean more chances to

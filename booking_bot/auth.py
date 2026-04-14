@@ -12,9 +12,7 @@ from playwright.sync_api import Frame
 from booking_bot import chat, config
 from booking_bot.exceptions import (
     AuthFailedError,
-    FatalError,
     OptionNotFoundError,
-    RestartableFatalError,
 )
 
 log = logging.getLogger("auth")
@@ -47,65 +45,41 @@ def _wait_for_known_state(frame: Frame, total_timeout_s: float = 20.0) -> str:
 
 def login_if_needed(
     frame: Frame, operator_phone: str, get_otp: Callable[[], str],
-) -> None:
+) -> str:
     """Bring the chat to a logged-in state, doing as little work as possible.
 
-    - NEEDS_OPERATOR_AUTH → type phone, then OTP
-    - NEEDS_OPERATOR_OTP  → type OTP only (phone already accepted)
-    - anything else       → session already active, no-op
+    Return values (Section 1 of the survivability design):
 
-    Unlike full_auth, this does NOT walk any menu. Use it when the rest of
-    the navigation is handled by a playbook."""
-    import time
+      "authed"          — session was already active, no work done.
+      "authed_freshly"  — we just typed phone + OTP. The persistent
+                          timestamp is already written.
+      "cooldown_wait"   — detected NEEDS_OPERATOR_AUTH or NEEDS_OPERATOR_OTP
+                          less than AUTH_COOLDOWN_S after the last successful
+                          auth. Refused to type anything. Caller should
+                          enter the quiet retry loop.
+
+    The cooldown is what stops the OTP-flood pattern: every gateway flap
+    used to trigger phone-number entry, and HPCL was firing ~50 SMS per
+    real OTP. With the cooldown, a full day of 100+ flaps produces at
+    most one real phone-number submission.
+
+    Unlike full_auth, this does NOT walk any menu. Use it when the rest
+    of the navigation is handled by a playbook."""
     from booking_bot import browser  # late import to avoid cycle
 
     state = _wait_for_known_state(frame)
     log.info(f"login_if_needed: detected state={state!r}")
 
-    # Recent-auth guard: HPCL's PWA occasionally flashes the login OR
-    # OTP-entry screen briefly after a reload that followed a gateway hiccup,
-    # even though the server-side session is still valid. If we authed
-    # successfully less than RECENT_AUTH_WINDOW_S ago, wait once and re-read
-    # state before prompting the operator for credentials they just typed.
-    #
-    # Both NEEDS_OPERATOR_AUTH and NEEDS_OPERATOR_OTP are covered: the OTP
-    # state is sometimes matched from stale "OTP sent to..." chat bubbles
-    # left in the scroller from a prior auth cycle, which is a classifier
-    # false positive and should NOT prompt the operator for another OTP.
     if state in ("NEEDS_OPERATOR_AUTH", "NEEDS_OPERATOR_OTP"):
         age = browser.last_auth_age_s()
-        if age is not None and age < config.RECENT_AUTH_WINDOW_S:
+        if age is not None and age < config.AUTH_COOLDOWN_S:
             log.warning(
-                f"{state} detected {age:.0f}s after a successful auth — "
-                f"waiting {config.RECENT_AUTH_RECHECK_S}s to see if HPCL "
-                f"settles back into the logged-in state"
+                f"{state} detected {age:.0f}s after last successful auth "
+                f"(cooldown = {config.AUTH_COOLDOWN_S}s) — refusing to type "
+                f"operator phone to avoid OTP SMS flood. Caller should "
+                f"enter quiet retry mode."
             )
-            time.sleep(config.RECENT_AUTH_RECHECK_S)
-            state = _wait_for_known_state(frame)
-            log.info(f"login_if_needed: after re-check, state={state!r}")
-            if state in ("NEEDS_OPERATOR_AUTH", "NEEDS_OPERATOR_OTP"):
-                # The recheck didn't help — HPCL really is back on the login
-                # screen. This is the OTP-flood pattern. Increment the
-                # rapid-reauth counter; if we've done this too many times in
-                # a row, raise a RestartableFatalError so cli.main() can
-                # close-and-relaunch the browser (which has historically
-                # been the operator's manual fix for this stuck state).
-                count = browser.note_rapid_reauth()
-                log.warning(
-                    f"rapid re-auth detected (#{count}/"
-                    f"{config.MAX_CONSECUTIVE_REAUTHS}): {state} persisted "
-                    f"past the recheck"
-                )
-                if count >= config.MAX_CONSECUTIVE_REAUTHS:
-                    raise RestartableFatalError(
-                        f"OTP-flood circuit breaker tripped: HPCL kept "
-                        f"flashing the login/OTP screen within "
-                        f"{config.RECENT_AUTH_WINDOW_S}s of the last "
-                        f"successful auth {count} times in a row. Triggering "
-                        f"in-process browser restart — the persistent "
-                        f"profile retains the session cookies, so a fresh "
-                        f"launch usually lands on a live session."
-                    )
+            return "cooldown_wait"
 
     if state == "UNKNOWN":
         log.warning(
@@ -114,6 +88,7 @@ def login_if_needed(
             "isn't in the expected state. Visible snapshot for debugging:"
         )
         log.warning(chat.dump_visible_state(frame))
+
     if state == "NEEDS_OPERATOR_AUTH":
         log.info(f"typing operator phone {operator_phone[:3]}XXXXXXX")
         chat.send_text(frame, operator_phone)
@@ -123,15 +98,18 @@ def login_if_needed(
         chat.send_text(frame, otp)
         chat.wait_until_settled(frame)
         browser.mark_auth_success()
+        return "authed_freshly"
     elif state == "NEEDS_OPERATOR_OTP":
         otp = get_otp()
         log.info("typing OTP (not logged)")
         chat.send_text(frame, otp)
         chat.wait_until_settled(frame)
         browser.mark_auth_success()
+        return "authed_freshly"
     else:
         log.info("session already active; skipping operator auth")
         browser.mark_auth_success()
+        return "authed"
 
 
 def full_auth(frame: Frame, operator_phone: str, get_otp: Callable[[], str]) -> None:

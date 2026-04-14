@@ -378,7 +378,6 @@ def main() -> None:
                 sys.exit(1)
             restarts_used += 1
             pre_handles = (None, None, None, None, None)
-            browser.reset_rapid_reauth_counter()
             browser.reset_gateway_flag()
             log.warning(
                 f"auto-restart {restarts_used}/{config.MAX_AUTO_RESTARTS}: "
@@ -465,7 +464,17 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
             # replay a few times — reloading the page between attempts via
             # _recover_with_playbook (which already handles login + replay) —
             # so a transient 502 on startup doesn't kill the whole batch.
-            login_if_needed(frame, config.OPERATOR_PHONE, _prompt_otp)
+            auth_result = login_if_needed(frame, config.OPERATOR_PHONE, _prompt_otp)
+            if auth_result == "cooldown_wait":
+                # Section 1 + Section 3: cooldown refused to type phone.
+                # Enter quiet retry (Task 4 replaces this placeholder body
+                # with the real loop). For now, raise Restartable so the
+                # outer auto-restart re-enters a fresh process.
+                raise RestartableFatalError(
+                    "auth cooldown active at startup — session appears "
+                    "dead but AUTH_COOLDOWN_S has not elapsed. "
+                    "Entering auto-restart."
+                )
             last_err: Exception | None = None
             for auth_attempt in (1, 2, 3):
                 try:
@@ -613,7 +622,6 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
                             )
                     else:
                         consecutive_row_failures = 0
-                        browser.reset_rapid_reauth_counter()
 
                     if isinstance(result, chat.Success):
                         store.write_success(row_idx, result.code)
@@ -941,7 +949,14 @@ def _recover_with_playbook(page, pb, operator_phone, get_otp):
         browser.reset_gateway_flag()
         time.sleep(config.GATEWAY_RELOAD_WAIT_S)
     frame = browser.get_chat_frame(page)
-    login_if_needed(frame, operator_phone, get_otp)
+    auth_result = login_if_needed(frame, operator_phone, get_otp)
+    if auth_result == "cooldown_wait":
+        # Cooldown refused — surface as Restartable so the outer main
+        # loop takes over. Task 4's startup quiet retry will catch it.
+        raise RestartableFatalError(
+            "auth cooldown active mid-recovery — refusing to type "
+            "operator phone. Outer loop will handle quiet retry."
+        )
     try:
         playbook_mod.reset_to_customer_entry(frame, pb)
     except (OptionNotFoundError, ChatStuckError, GatewayError) as e:
