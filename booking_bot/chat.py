@@ -380,11 +380,22 @@ def detect_state(frame: Frame) -> str:
          buttons is what stops a stale "Book for Others" bubble from
          re-classifying us as BOOK_FOR_OTHERS_MENU after we've moved on.
 
-      2. Explicit auth/OTP scroller-text patterns — these strings are
-         unique to HPCL's auth gate and never appear in normal booking
-         flow, so checking them here is safe before the input-presence
-         heuristic (which would otherwise misread an auth input as the
-         customer-phone prompt).
+      2. Explicit auth/OTP patterns from the LATEST chat bubbles — these
+         strings are unique to HPCL's auth gate and never appear in normal
+         booking flow, so checking them here is safe before the input-
+         presence heuristic (which would otherwise misread an auth input
+         as the customer-phone prompt).
+
+         CRITICAL: we scan ONLY the last few bubble children of #scroller,
+         not `innerText.slice(-1000)`. The slice approach was the cause of
+         the OTP-flood loop: on a manual restart the persistent chrome
+         profile reopens the chat to a post-auth state (customer-phone
+         prompt), but the scrollback still contains the "OTP sent to..."
+         bubble from the prior auth cycle — which lives inside the last
+         1000 chars and false-positive matches `otp.*sent`. The bot then
+         prompts the operator for an OTP, types it into the customer-phone
+         input, HPCL rejects it, and the bot loops forever on the
+         "OTP crashing page".
 
       3. An EMPTY inline <input> that isn't the replybox — when buttons
          and auth-text don't match, an empty form field means HPCL is
@@ -395,7 +406,7 @@ def detect_state(frame: Frame) -> str:
          confuse the OLD filled customer-phone input from the
          just-completed row with a fresh prompt.
 
-      4. Last-resort scroller-text classifier — used only when nothing
+      4. Last-resort bubble-text classifier — used only when nothing
          interactive is in view (chat mid-load).
 
     The bug this fixes (prod log 2026-04-14 16:25): after clicking
@@ -426,8 +437,32 @@ def detect_state(frame: Frame) -> str:
                 return true;
               }});
               const s = document.querySelector('{config.SEL_SCROLLER}');
-              const text = s ? (s.innerText || '').slice(-1000) : '';
-              return {{buttons: btns, text: text, hasEmptyInput: inputs.length > 0}};
+              // Text of the LAST few bubble children — the "current prompt"
+              // as the operator sees it. Classifying off innerText.slice(-1000)
+              // is unsafe because stale 'OTP sent to...' bubbles live inside
+              // that tail and false-positive the auth classifier on a healthy
+              // session (the OTP-flood loop, fixed 2026-04-14).
+              let recentText = '';
+              if (s) {{
+                const kids = Array.from(s.children);
+                const recent = [];
+                for (let i = kids.length - 1; i >= 0 && recent.length < 5; i--) {{
+                  const t = (kids[i].innerText || '').trim();
+                  if (t) recent.unshift(t);
+                }}
+                recentText = recent.join('\\n');
+                // Fallback for flat scroller layouts (no per-message children):
+                // last 400 chars of innerText. Half the old 1000-char slice, so
+                // it rarely spans more than one recent bubble.
+                if (!recentText) {{
+                  recentText = (s.innerText || '').slice(-400);
+                }}
+              }}
+              return {{
+                buttons: btns,
+                text: recentText,
+                hasEmptyInput: inputs.length > 0,
+              }};
             }}
             """
         )
@@ -444,7 +479,7 @@ def detect_state(frame: Frame) -> str:
         if button_state != "UNKNOWN":
             return button_state
 
-    # Priority 2: explicit auth/OTP patterns from scroller text.
+    # Priority 2: explicit auth/OTP patterns from the LATEST bubbles only.
     for state_name in ("NEEDS_OPERATOR_AUTH", "NEEDS_OPERATOR_OTP"):
         for p in config.STATE_PATTERNS[state_name]:
             if p.search(text or ""):
@@ -454,7 +489,7 @@ def detect_state(frame: Frame) -> str:
     if has_empty_input:
         return "READY_FOR_CUSTOMER"
 
-    # Priority 4: weakest fallback — scroller text only.
+    # Priority 4: weakest fallback — recent bubble text only.
     return _classify_state([], text)
 
 

@@ -442,7 +442,9 @@ def replay_auth(
     log.info("playbook auth: done")
 
 
-def reset_to_customer_entry(frame: Frame, playbook: Playbook) -> None:
+def reset_to_customer_entry(
+    frame: Frame, playbook: Playbook, _escape_tried: bool = False,
+) -> None:
     """Navigate the chat from ANY state back to 'enter customer phone' with
     the MINIMUM number of clicks. Previous incarnations blindly clicked Main
     Menu → Booking Services → Book for Others regardless of current state,
@@ -462,6 +464,15 @@ def reset_to_customer_entry(frame: Frame, playbook: Playbook) -> None:
       3. Booking Services enabled → click it, wait, then click Book for
          Others (we're on the main menu).
       4. Main Menu enabled → click it, wait, replay full auth_prefix.
+
+    ESCAPE HATCH: if NONE of the nav buttons above are visible but 'No' is
+    enabled, we're stuck on a dangling Yes/No confirmation bubble — this
+    happens after a 502 during a 'Yes' click, where HPCL disables the Yes
+    we already clicked and leaves only No. Click No to dismiss the
+    confirmation (HPCL then redraws the parent menu with the nav buttons
+    enabled) and retry reset once. Without this, the stuck state forced a
+    full page reload, which destroyed the chat session and dragged the bot
+    through the OTP-flood loop.
 
     Only Raises IframeLostError / OptionNotFoundError if NONE of the above
     paths work — in which case the caller falls back to full recovery."""
@@ -545,6 +556,28 @@ def reset_to_customer_entry(frame: Frame, playbook: Playbook) -> None:
         replay_actions(frame, playbook.auth_prefix, {})
         log.info("playbook: reset done (Main Menu path)")
         return
+
+    # Dangling-confirmation escape hatch. If none of the nav buttons above
+    # matched but 'No' is enabled, we're on a stuck Yes/No bubble (a 502
+    # ate the 'Yes' click and left only 'No'). Dismissing with 'No' returns
+    # to the prior menu, which usually has the nav buttons. Guarded by
+    # _escape_tried so we can't loop forever if 'No' itself leads nowhere.
+    if not _escape_tried and _has("no"):
+        log.warning(
+            f"playbook: reset stuck on dangling confirmation "
+            f"(enabled={enabled!r}); clicking 'No' to dismiss and retrying reset"
+        )
+        try:
+            _click_by_action(
+                frame,
+                Action(kind="click", button_text="No", button_id=None),
+            )
+        except OptionNotFoundError:
+            log.warning("playbook: 'No' click failed; falling through to raise")
+        else:
+            chat.wait_until_settled(frame)
+            reset_to_customer_entry(frame, playbook, _escape_tried=True)
+            return
 
     raise OptionNotFoundError(
         f"reset_to_customer_entry: no usable nav button; enabled={enabled}"

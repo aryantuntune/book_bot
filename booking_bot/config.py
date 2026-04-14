@@ -80,11 +80,17 @@ RECENT_AUTH_RECHECK_S = 15
 MAX_CONSECUTIVE_ROW_FAILURES = 5
 # MAX_CONSECUTIVE_REAUTHS: how many times in a row login_if_needed is
 # allowed to detect NEEDS_OPERATOR_AUTH within RECENT_AUTH_WINDOW_S of a
-# previous successful auth before we abort. The recent-auth recheck is
-# our first line of defence; this is the second, in case the session
-# really is being destroyed every reload and prompting more OTPs would
-# burn through the operator's daily quota for nothing.
-MAX_CONSECUTIVE_REAUTHS      = 3
+# previous successful auth before we abort. Lowered from 3 to 1 on
+# 2026-04-15: the operator cannot disturb their HPCL client for a fresh
+# OTP every time a transient gateway flap flashes the login screen. On
+# the FIRST rapid-reauth detection we now raise RestartableFatalError,
+# which triggers an in-process browser restart. The persistent chrome
+# profile retains the session cookies, so the relaunch almost always
+# lands on a live post-auth state without any operator intervention.
+# If cookies are ALSO dead, the new process starts with
+# last_auth_age_s()=None so the recent-auth guard skips and we fall
+# through to a legitimate one-time OTP prompt — no restart loop.
+MAX_CONSECUTIVE_REAUTHS      = 1
 # IN_PLACE_POLL_S: how long recover_session / _recover_with_playbook
 # should keep polling the in-place frame for a non-UNKNOWN state before
 # falling back to a full page reload. Larger values mean more chances to
@@ -105,9 +111,12 @@ AUTO_RESTART_WAIT_S          = 30
 # When the bot is blocked on a manual input (OTP prompt, --keep-open pause)
 # for more than IDLE_ALERT_AFTER_S, start beeping the device every
 # IDLE_ALERT_INTERVAL_S until the input is received. Prevents the operator
-# from missing a stuck bot that's silently waiting on a dialog.
-IDLE_ALERT_AFTER_S           = 120
-IDLE_ALERT_INTERVAL_S        = 30
+# from missing a stuck bot that's silently waiting on a dialog. Lowered
+# from 120s to 30s on 2026-04-15 after the operator missed an OTP prompt
+# that fired at the 99-second mark — the old threshold was too slow to
+# catch real-world blocks.
+IDLE_ALERT_AFTER_S           = 30
+IDLE_ALERT_INTERVAL_S        = 15
 
 # ---- DOM selectors ----
 OUTER_IFRAME_SEL = "iframe#webform"
