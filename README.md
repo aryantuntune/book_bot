@@ -45,6 +45,33 @@ If the bot crashes or you Ctrl-C it, just run it again with the same input
 file. Rows that already have a value in column C (code or `ISSUE`) are
 skipped; only pending rows are attempted.
 
+## Shareable `.exe`
+
+Build a single-file Windows `.exe` (≈65 MB, WhatsApp-shareable) that drives
+the operator's installed Google Chrome via Playwright:
+
+```
+pip install -r requirements-build.txt
+python -m PyInstaller booking_bot.spec --clean --noconfirm
+```
+
+Output: `dist/booking_bot.exe`. Requires Chrome to be installed on the
+target machine (drops ~345 MB of bundled Chromium).
+
+Runtime behavior:
+
+- **Double-click** → opens a visible Chrome window + a pop-up console that
+  shows live logs. The startup dialog asks for the input `.xlsx` file,
+  plus the operator phone + OTP on first run.
+- **`booking_bot.exe --headless`** (from cmd / PowerShell) → runs in the
+  background with no browser window and no new terminal. Requires a
+  previously-established session in `.chrome-profile/` next to the `.exe`,
+  so run the bot once non-headless first to cache the operator OTP.
+
+The `.exe` writes `Input/`, `Output/`, `Issues/`, `logs/`, and
+`.chrome-profile/` as siblings of itself, so drop the binary in an
+empty folder the operator owns.
+
 ## Tests
 
 ```
