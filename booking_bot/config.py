@@ -91,6 +91,24 @@ MAX_CONSECUTIVE_REAUTHS      = 3
 # avoid a session-destroying reload during a transient flap.
 IN_PLACE_POLL_S              = 30
 
+# ---- Auto-restart (RestartableFatalError handling) ----
+# When a circuit breaker trips with RestartableFatalError, cli.main() closes
+# the browser, waits, and relaunches from scratch. The persistent chrome
+# profile keeps HPCL's session cookies, so a relaunch usually lands on a live
+# session without prompting the operator. MAX_AUTO_RESTARTS caps the number
+# of times this can happen in a single run so a truly stuck state (e.g. real
+# sustained outage) doesn't loop forever.
+MAX_AUTO_RESTARTS            = 5
+AUTO_RESTART_WAIT_S          = 30
+
+# ---- Idle alert (manual-input watchdog) ----
+# When the bot is blocked on a manual input (OTP prompt, --keep-open pause)
+# for more than IDLE_ALERT_AFTER_S, start beeping the device every
+# IDLE_ALERT_INTERVAL_S until the input is received. Prevents the operator
+# from missing a stuck bot that's silently waiting on a dialog.
+IDLE_ALERT_AFTER_S           = 120
+IDLE_ALERT_INTERVAL_S        = 30
+
 # ---- DOM selectors ----
 OUTER_IFRAME_SEL = "iframe#webform"
 INNER_IFRAME_SEL = "iframe[name='iframe']"

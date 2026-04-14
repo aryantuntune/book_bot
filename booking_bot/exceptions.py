@@ -31,6 +31,14 @@ class FatalError(BookingBotError):
     """Unrecoverable: the top-level cli loop writes an ISSUE row and exits."""
 
 
+class RestartableFatalError(FatalError):
+    """Circuit-breaker fatal that cli.main() handles by closing the browser,
+    waiting briefly, and relaunching from scratch. The persistent profile dir
+    retains the HPCL session cookies, so a relaunch usually lands on a live
+    session — mimicking the operator's manual 'stop and restart the bot'
+    workflow, which they historically used to escape the OTP-prompt loop."""
+
+
 class ChromeNotInstalledError(FatalError):
     """The shareable .exe tried to launch via channel="chrome" but the target
     machine has no Google Chrome install. Carries a human-readable install

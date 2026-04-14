@@ -10,7 +10,12 @@ from typing import Callable
 from playwright.sync_api import Frame
 
 from booking_bot import chat, config
-from booking_bot.exceptions import AuthFailedError, FatalError, OptionNotFoundError
+from booking_bot.exceptions import (
+    AuthFailedError,
+    FatalError,
+    OptionNotFoundError,
+    RestartableFatalError,
+)
 
 log = logging.getLogger("auth")
 
@@ -57,45 +62,49 @@ def login_if_needed(
     state = _wait_for_known_state(frame)
     log.info(f"login_if_needed: detected state={state!r}")
 
-    # Recent-auth guard: HPCL's PWA occasionally flashes the login screen
-    # briefly after a reload that followed a gateway hiccup, even though the
-    # server-side session is still valid. If we authed successfully less
-    # than RECENT_AUTH_WINDOW_S ago, wait once and re-read state before
-    # asking the operator for an OTP they just typed.
-    if state == "NEEDS_OPERATOR_AUTH":
+    # Recent-auth guard: HPCL's PWA occasionally flashes the login OR
+    # OTP-entry screen briefly after a reload that followed a gateway hiccup,
+    # even though the server-side session is still valid. If we authed
+    # successfully less than RECENT_AUTH_WINDOW_S ago, wait once and re-read
+    # state before prompting the operator for credentials they just typed.
+    #
+    # Both NEEDS_OPERATOR_AUTH and NEEDS_OPERATOR_OTP are covered: the OTP
+    # state is sometimes matched from stale "OTP sent to..." chat bubbles
+    # left in the scroller from a prior auth cycle, which is a classifier
+    # false positive and should NOT prompt the operator for another OTP.
+    if state in ("NEEDS_OPERATOR_AUTH", "NEEDS_OPERATOR_OTP"):
         age = browser.last_auth_age_s()
         if age is not None and age < config.RECENT_AUTH_WINDOW_S:
             log.warning(
-                f"NEEDS_OPERATOR_AUTH detected {age:.0f}s after a successful "
-                f"auth — waiting {config.RECENT_AUTH_RECHECK_S}s to see if "
-                f"HPCL settles back into the logged-in state"
+                f"{state} detected {age:.0f}s after a successful auth — "
+                f"waiting {config.RECENT_AUTH_RECHECK_S}s to see if HPCL "
+                f"settles back into the logged-in state"
             )
             time.sleep(config.RECENT_AUTH_RECHECK_S)
             state = _wait_for_known_state(frame)
             log.info(f"login_if_needed: after re-check, state={state!r}")
-            if state == "NEEDS_OPERATOR_AUTH":
+            if state in ("NEEDS_OPERATOR_AUTH", "NEEDS_OPERATOR_OTP"):
                 # The recheck didn't help — HPCL really is back on the login
-                # screen. This is the OTP-flood pattern: the operator just
-                # typed an OTP, we accepted it, and now we're being asked for
-                # another one. Increment the rapid-reauth counter; if we've
-                # done this too many times in a row, abort the batch instead
-                # of burning through the operator's daily OTP quota.
+                # screen. This is the OTP-flood pattern. Increment the
+                # rapid-reauth counter; if we've done this too many times in
+                # a row, raise a RestartableFatalError so cli.main() can
+                # close-and-relaunch the browser (which has historically
+                # been the operator's manual fix for this stuck state).
                 count = browser.note_rapid_reauth()
                 log.warning(
                     f"rapid re-auth detected (#{count}/"
-                    f"{config.MAX_CONSECUTIVE_REAUTHS}): NEEDS_OPERATOR_AUTH "
-                    f"persisted past the recheck"
+                    f"{config.MAX_CONSECUTIVE_REAUTHS}): {state} persisted "
+                    f"past the recheck"
                 )
                 if count >= config.MAX_CONSECUTIVE_REAUTHS:
-                    raise FatalError(
-                        f"OTP-flood circuit breaker tripped: detected "
-                        f"NEEDS_OPERATOR_AUTH within {config.RECENT_AUTH_WINDOW_S}s "
-                        f"of the last successful auth {count} times in a row. "
-                        f"HPCL's session is being destroyed faster than we can "
-                        f"re-establish it — typically a sustained gateway "
-                        f"outage. Stopping the batch so the operator's daily "
-                        f"OTP quota isn't burned. Wait 10-30 minutes and "
-                        f"rerun; the bot will resume from where it left off."
+                    raise RestartableFatalError(
+                        f"OTP-flood circuit breaker tripped: HPCL kept "
+                        f"flashing the login/OTP screen within "
+                        f"{config.RECENT_AUTH_WINDOW_S}s of the last "
+                        f"successful auth {count} times in a row. Triggering "
+                        f"in-process browser restart — the persistent "
+                        f"profile retains the session cookies, so a fresh "
+                        f"launch usually lands on a live session."
                     )
 
     if state == "UNKNOWN":

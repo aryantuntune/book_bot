@@ -12,6 +12,7 @@ import logging
 import re
 import signal
 import sys
+import threading
 import time
 from getpass import getpass
 from pathlib import Path
@@ -25,6 +26,7 @@ from booking_bot.exceptions import (
     GatewayError,
     IframeLostError,
     OptionNotFoundError,
+    RestartableFatalError,
 )
 from booking_bot.logging_setup import setup_logging
 
@@ -79,6 +81,51 @@ _USE_GUI_OTP = False
 _HEADLESS = False
 
 
+def _start_idle_alert() -> threading.Event:
+    """Start a daemon watchdog thread that beeps the device when the bot has
+    been waiting for manual input longer than config.IDLE_ALERT_AFTER_S.
+    After the initial grace period the thread rings every
+    config.IDLE_ALERT_INTERVAL_S until the returned Event is set.
+
+    Use as::
+
+        stop = _start_idle_alert()
+        try:
+            value = blocking_prompt()
+        finally:
+            stop.set()
+
+    On Windows uses winsound.MessageBeep (the system "exclamation" sound, same
+    alert the OS uses for warning dialogs — loud enough to notice across the
+    room). On other platforms writes BEL to stdout as a best-effort fallback.
+    """
+    stop = threading.Event()
+
+    def _beep_loop() -> None:
+        if stop.wait(config.IDLE_ALERT_AFTER_S):
+            return
+        log.warning(
+            f"idle alert: bot has been waiting for manual input for "
+            f"{config.IDLE_ALERT_AFTER_S}s — ringing device every "
+            f"{config.IDLE_ALERT_INTERVAL_S}s until resolved"
+        )
+        while not stop.is_set():
+            try:
+                if sys.platform == "win32":
+                    import winsound
+                    winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+                else:
+                    sys.stdout.write("\a")
+                    sys.stdout.flush()
+            except Exception:
+                pass
+            if stop.wait(config.IDLE_ALERT_INTERVAL_S):
+                return
+
+    threading.Thread(target=_beep_loop, daemon=True).start()
+    return stop
+
+
 def _prompt_otp() -> str:
     """Blocking OTP prompt. Uses a tkinter popup when the startup dialog was
     shown (double-clicked .exe) and getpass() otherwise, so dev runs from a
@@ -93,10 +140,14 @@ def _prompt_otp() -> str:
             "establish the session, then subsequent --headless runs will "
             "use the cached cookies in .chrome-profile/."
         )
-    if _USE_GUI_OTP:
-        from booking_bot import ui
-        return ui.prompt_otp(config.OPERATOR_PHONE)
-    return getpass(f"Enter OTP for {config.OPERATOR_PHONE}: ").strip()
+    stop = _start_idle_alert()
+    try:
+        if _USE_GUI_OTP:
+            from booking_bot import ui
+            return ui.prompt_otp(config.OPERATOR_PHONE)
+        return getpass(f"Enter OTP for {config.OPERATOR_PHONE}: ").strip()
+    finally:
+        stop.set()
 
 
 def _resolve_playbook_path(explicit: Path | None, no_playbook: bool) -> Path | None:
@@ -301,18 +352,63 @@ def main() -> None:
 
     _install_signal_handler()
 
-    pw = browser_obj = ctx = page = frame = None
+    # Auto-restart loop: _run_session_attempt runs one full browser session +
+    # row-processing pass and closes its browser handles in a finally block
+    # before returning or propagating. RestartableFatalError (from the OTP-
+    # flood, 502-cascade, and unexpected-error circuit breakers) signals that
+    # a fresh relaunch has a good chance of recovering the session — the
+    # persistent chrome profile retains HPCL session cookies so the new
+    # browser often lands already logged in. Bounded by MAX_AUTO_RESTARTS so
+    # a genuinely stuck state fails loudly instead of looping forever.
+    pre_handles = (_pre_pw, _pre_browser, _pre_ctx, _pre_page, _pre_frame)
+    restarts_used = 0
+    while True:
+        try:
+            _run_session_attempt(store, args, pb, pre_handles)
+            break
+        except RestartableFatalError as e:
+            log.error(f"FATAL (restartable): {e}")
+            if restarts_used >= config.MAX_AUTO_RESTARTS:
+                log.error(
+                    f"auto-restart budget exhausted "
+                    f"({restarts_used}/{config.MAX_AUTO_RESTARTS}); giving up. "
+                    f"Pending rows remain pending and will resume on the next run."
+                )
+                _pause_if_keep_open(args.keep_open, None)
+                sys.exit(1)
+            restarts_used += 1
+            pre_handles = (None, None, None, None, None)
+            browser.reset_rapid_reauth_counter()
+            browser.reset_gateway_flag()
+            log.warning(
+                f"auto-restart {restarts_used}/{config.MAX_AUTO_RESTARTS}: "
+                f"waiting {config.AUTO_RESTART_WAIT_S}s before relaunching browser"
+            )
+            time.sleep(config.AUTO_RESTART_WAIT_S)
+
+    log.info(f"final summary: {store.summary()}")
+    log.info(store.progress_line())
+    log.info("booking_bot done")
+
+
+def _run_session_attempt(store, args, pb, pre_handles) -> None:
+    """Run one browser session: launch (or reuse pre-launched handles),
+    authenticate, process pending rows, close the browser. Called by
+    main() in a loop so RestartableFatalError can trigger a full relaunch
+    without any operator intervention.
+
+    Closes its browser handles in a finally block before returning or
+    propagating exceptions. Raises RestartableFatalError when a circuit
+    breaker trips (caller handles the restart decision). FatalError
+    causes sys.exit(1). Other exceptions are re-raised after logging the
+    visible chat state."""
+    pw, browser_obj, ctx, page, frame = pre_handles
     current_row_idx: int | None = None
     current_phone: str | None = None
 
     try:
-        if _pre_pw is not None:
+        if pw is not None:
             # GUI bootstrap already opened the browser and loaded the chat.
-            pw = _pre_pw
-            browser_obj = _pre_browser
-            ctx = _pre_ctx
-            page = _pre_page
-            frame = _pre_frame
             log.info("re-using pre-launched browser from GUI bootstrap")
         else:
             pw, browser_obj, ctx, page = browser.start_browser(
@@ -487,14 +583,15 @@ def main() -> None:
                             f"{result.reason}"
                         )
                         if consecutive_row_failures >= config.MAX_CONSECUTIVE_ROW_FAILURES:
-                            raise FatalError(
+                            raise RestartableFatalError(
                                 f"502-cascade circuit breaker tripped: "
                                 f"{consecutive_row_failures} rows in a row failed "
-                                f"in the recovery path. HPCL is in a sustained "
-                                f"outage. Stopping the batch so the rest of the "
-                                f"file isn't marked as skipped. Wait 10-30 "
-                                f"minutes and rerun — pending rows will resume "
-                                f"from where they left off."
+                                f"in the recovery path. HPCL may be in a sustained "
+                                f"outage or the bot's session may be wedged. "
+                                f"Triggering in-process browser restart — the "
+                                f"persistent profile retains session cookies, so "
+                                f"a fresh launch often recovers without operator "
+                                f"intervention."
                             )
                     else:
                         consecutive_row_failures = 0
@@ -578,12 +675,13 @@ def main() -> None:
                         f"(unexpected:{type(row_e).__name__})"
                     )
                     if consecutive_row_failures >= config.MAX_CONSECUTIVE_ROW_FAILURES:
-                        raise FatalError(
+                        raise RestartableFatalError(
                             f"unexpected-error circuit breaker tripped: "
                             f"{consecutive_row_failures} rows in a row failed "
-                            f"with unhandled exceptions. Stopping the batch — "
-                            f"this looks like a sustained outage rather than "
-                            f"a one-off glitch. Wait 10-30 minutes and rerun."
+                            f"with unhandled exceptions. Triggering in-process "
+                            f"browser restart — a fresh relaunch often recovers "
+                            f"the session. If the restart budget is exhausted "
+                            f"the batch will exit cleanly."
                         ) from row_e
                     try:
                         store.write_issue(
@@ -648,6 +746,21 @@ def main() -> None:
 
         log.info(f"final summary: {store.summary()}")
 
+    except RestartableFatalError:
+        # Leave the row/phone written as an issue on the way out so the
+        # operator sees which row was in flight when the breaker tripped.
+        # main()'s outer loop decides whether to actually restart.
+        if current_row_idx is not None:
+            try:
+                store.write_issue(
+                    current_row_idx,
+                    str(current_phone or ""),
+                    reason="restart_triggered",
+                    raw=chat.dump_visible_state(frame) if frame else "<no-frame>",
+                )
+            except Exception as write_e:
+                log.error(f"  (could not write restart issue: {write_e})")
+        raise
     except FatalError as e:
         log.error(f"FATAL: {e}")
         if current_row_idx is not None:
@@ -691,9 +804,6 @@ def main() -> None:
                 pw.stop()
             except Exception:
                 pass
-        log.info(f"final summary: {store.summary()}")
-        log.info(store.progress_line())
-        log.info("booking_bot done")
 
 
 def _recover_with_playbook(page, pb, operator_phone, get_otp):
@@ -819,10 +929,13 @@ def _pause_if_keep_open(keep_open: bool, frame) -> None:
     print("--keep-open: browser is paused. Inspect the Chrome window,")
     print("then press Enter here to close it and exit.")
     print("=" * 60, flush=True)
+    stop = _start_idle_alert()
     try:
         input()
     except EOFError:
         pass
+    finally:
+        stop.set()
 
 
 if __name__ == "__main__":
