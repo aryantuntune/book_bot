@@ -192,22 +192,46 @@ def _resolve_playbook_path(explicit: Path | None, no_playbook: bool) -> Path | N
 
 # -------- Main loop --------
 
+# Section 3 of the survivability design. The old handler restored the
+# default SIGINT handler on first Ctrl-C, so a rapid double-tap raised
+# KeyboardInterrupt mid-ctx.close() and left Playwright's async close
+# task dangling (observed in the 02:47:20 log: "Task was destroyed but
+# it is pending!" + "Connection closed while reading from the driver").
 _should_stop = False
+_ctrl_c_count = 0
+_force_shutdown = False
 
 
 def _install_signal_handler() -> None:
-    """First Ctrl-C: set the stop flag and restore the default SIGINT
-    handler. The bot will finish the current row and exit cleanly. Second
-    Ctrl-C (now handled by the default) raises KeyboardInterrupt and
-    unwinds immediately — the finally clause still closes the browser."""
+    """Shielded SIGINT handler:
+      1st Ctrl-C — set _should_stop, keep the handler installed so a
+                   fast second tap doesn't unwind mid-row.
+      2nd Ctrl-C — arm _force_shutdown; the finally: clause will run
+                   ctx.close() inside a SHUTDOWN_GRACE_S grace window.
+      3rd Ctrl-C — hard os._exit for the operator who really needs out.
+    """
     def _h(signum, frame):
-        global _should_stop
-        log.warning(
-            f"received signal {signum}; finishing current row then stopping. "
-            "Press Ctrl-C again to force immediate exit."
-        )
-        _should_stop = True
-        signal.signal(signal.SIGINT, signal.default_int_handler)
+        global _should_stop, _ctrl_c_count, _force_shutdown
+        _ctrl_c_count += 1
+        if _ctrl_c_count == 1:
+            log.warning(
+                f"received signal {signum}; finishing current row then "
+                f"stopping. Press Ctrl-C again for shielded shutdown "
+                f"(waits {config.SHUTDOWN_GRACE_S}s for cookie flush). "
+                f"A third Ctrl-C hard-exits."
+            )
+            _should_stop = True
+        elif _ctrl_c_count == 2:
+            log.warning(
+                f"received second Ctrl-C; entering shielded shutdown "
+                f"({config.SHUTDOWN_GRACE_S}s grace for ctx.close()). "
+                f"Third Ctrl-C will hard-exit immediately."
+            )
+            _force_shutdown = True
+        else:
+            log.error("third Ctrl-C; hard-exiting")
+            import os
+            os._exit(130)
     signal.signal(signal.SIGINT, _h)
 
 
@@ -390,6 +414,120 @@ def main() -> None:
     log.info("booking_bot done")
 
 
+def _shutdown_browser_shielded(ctx, browser_obj, pw) -> None:
+    """Close Playwright handles with a bounded grace window when
+    _force_shutdown is armed (double Ctrl-C). Clean exits still get
+    unbounded time — the whole point of the persistent profile is that
+    cookies survive. A wedged Playwright inside a shielded shutdown
+    hard-exits after SHUTDOWN_GRACE_S via os._exit(130)."""
+    import os
+    import threading
+
+    def _do_close():
+        if ctx is not None:
+            try:
+                ctx.close()
+            except Exception:
+                pass
+        if browser_obj is not None:
+            try:
+                browser_obj.close()
+            except Exception:
+                pass
+        if pw is not None:
+            try:
+                pw.stop()
+            except Exception:
+                pass
+
+    if not _force_shutdown:
+        _do_close()
+        return
+
+    t = threading.Thread(target=_do_close, daemon=True)
+    t.start()
+    t.join(timeout=config.SHUTDOWN_GRACE_S)
+    if t.is_alive():
+        log.error(
+            f"browser shutdown still running after "
+            f"{config.SHUTDOWN_GRACE_S}s grace window — hard-exiting"
+        )
+    os._exit(130)
+
+
+def _quiet_retry_until_alive_or_dead(page, pb, store) -> str:
+    """Section 3 of the survivability design. Enter a no-phone-number-typing
+    loop that reloads the page every 60s and polls for a live chat state.
+    Returns one of:
+
+      "alive"     — state came back as READY_FOR_CUSTOMER / MAIN_MENU /
+                    BOOK_FOR_OTHERS_MENU. Caller should resume; a fresh
+                    frame is available via page.main_frame.
+      "drained"   — quiet retry deadline elapsed AND pending_rows() is
+                    empty. Batch naturally completed during the wait.
+                    Caller should exit 0 without alarming the operator.
+      "needs_otp" — quiet retry deadline elapsed AND pending_rows() is
+                    non-empty. Fresh OTP would unblock real work.
+                    Caller should fire the idle alarm and prompt for OTP.
+
+    Crucially: this function NEVER calls login_if_needed. It never types
+    the operator phone. Zero OTP SMS are triggered during quiet retry.
+    That is the single behavioural difference from the old recovery path
+    and the only reason the 3-hour cooldown is safe.
+    """
+    log.warning(
+        f"quiet retry mode: reloading every 60s for up to "
+        f"{config.SESSION_DEAD_QUIET_RETRY_S}s — NO phone/OTP typing. "
+        f"Triggered because auth cooldown is still active."
+    )
+    deadline = time.monotonic() + config.SESSION_DEAD_QUIET_RETRY_S
+    reload_interval_s = 60.0
+    alive_states = ("READY_FOR_CUSTOMER", "MAIN_MENU", "BOOK_FOR_OTHERS_MENU")
+
+    while time.monotonic() < deadline:
+        if _should_stop:
+            log.warning("quiet retry: Ctrl-C received; exiting early")
+            return "needs_otp"
+        try:
+            browser.reset_gateway_flag()
+            page.reload(wait_until="domcontentloaded", timeout=60_000)
+            page.wait_for_timeout(config.PAGE_LOAD_WAIT_S * 1000)
+            frame = browser.get_chat_frame(page)
+            state = chat.detect_state(frame)
+            log.info(f"quiet retry: state={state!r}")
+            if state in alive_states:
+                log.info("quiet retry: session alive — resuming")
+                return "alive"
+        except Exception as e:
+            log.warning(
+                f"quiet retry tick failed: {type(e).__name__}: {e} — "
+                f"continuing to wait"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(reload_interval_s, remaining))
+
+    log.warning(
+        f"quiet retry: {config.SESSION_DEAD_QUIET_RETRY_S}s elapsed without "
+        f"session recovery — running session-dead cleanup"
+    )
+    has_retriable, pending_count = _session_dead_cleanup_has_retriable_rows(store)
+    if not has_retriable:
+        log.info(
+            "quiet retry: session dead BUT pending_rows() is empty — "
+            "batch drained during the wait. Exiting cleanly with no "
+            "operator alarm."
+        )
+        return "drained"
+    log.error(
+        f"SESSION DEAD — OPERATOR OTP REQUIRED — {pending_count} retriable "
+        f"row(s) remain. Leaving browser open so the operator can paste "
+        f"a fresh OTP once they arrive."
+    )
+    return "needs_otp"
+
+
 def _session_dead_cleanup_has_retriable_rows(store) -> tuple[bool, int]:
     """Section 5 of the survivability design. Called after the 30-min quiet
     retry loop has given up waiting for HPCL's session to heal.
@@ -467,14 +605,33 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
             auth_result = login_if_needed(frame, config.OPERATOR_PHONE, _prompt_otp)
             if auth_result == "cooldown_wait":
                 # Section 1 + Section 3: cooldown refused to type phone.
-                # Enter quiet retry (Task 4 replaces this placeholder body
-                # with the real loop). For now, raise Restartable so the
-                # outer auto-restart re-enters a fresh process.
-                raise RestartableFatalError(
-                    "auth cooldown active at startup — session appears "
-                    "dead but AUTH_COOLDOWN_S has not elapsed. "
-                    "Entering auto-restart."
-                )
+                # Enter quiet retry — 30 min of silent reload-and-poll.
+                outcome = _quiet_retry_until_alive_or_dead(page, pb, store)
+                if outcome == "drained":
+                    log.info(
+                        "batch drained during quiet retry; exiting "
+                        "_run_session_attempt cleanly"
+                    )
+                    return
+                if outcome == "needs_otp":
+                    # Section 5: fresh OTP would unblock real work. Clear
+                    # the cooldown file so login_if_needed accepts a new
+                    # phone submission, re-fetch the frame, and call it
+                    # again. The operator will hear the idle alarm from
+                    # _prompt_otp's watchdog thread.
+                    browser.clear_auth_cooldown()
+                    frame = browser.get_chat_frame(page)
+                    auth_result = login_if_needed(
+                        frame, config.OPERATOR_PHONE, _prompt_otp,
+                    )
+                    if auth_result == "cooldown_wait":
+                        raise RestartableFatalError(
+                            "cooldown_wait persisted even after "
+                            "clear_auth_cooldown — Section 1 state file "
+                            "is not being reset correctly"
+                        )
+                else:  # "alive"
+                    frame = browser.get_chat_frame(page)
             last_err: Exception | None = None
             for auth_attempt in (1, 2, 3):
                 try:
@@ -849,24 +1006,12 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
         _pause_if_keep_open(args.keep_open, frame)
         raise
     finally:
-        # Close the context first (persistent mode) so cookies are flushed
-        # to .chrome-profile/, then close the legacy Browser handle if
-        # present (non-persistent mode), then stop Playwright.
-        if ctx is not None:
-            try:
-                ctx.close()
-            except Exception:
-                pass
-        if browser_obj is not None:
-            try:
-                browser_obj.close()
-            except Exception:
-                pass
-        if pw is not None:
-            try:
-                pw.stop()
-            except Exception:
-                pass
+        # Close the context first (persistent mode) so cookies are flushed,
+        # then the legacy Browser handle, then stop Playwright. Under
+        # _force_shutdown (double Ctrl-C) the close runs in a background
+        # thread with a SHUTDOWN_GRACE_S cap so a wedged Playwright can't
+        # hold the terminal hostage.
+        _shutdown_browser_shielded(ctx, browser_obj, pw)
 
 
 def _recover_with_playbook(page, pb, operator_phone, get_otp):

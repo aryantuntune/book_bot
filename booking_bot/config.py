@@ -95,8 +95,26 @@ IN_PLACE_POLL_S              = 30
 # session without prompting the operator. MAX_AUTO_RESTARTS caps the number
 # of times this can happen in a single run so a truly stuck state (e.g. real
 # sustained outage) doesn't loop forever.
-MAX_AUTO_RESTARTS            = 5
+#
+# 200 is far more than any single overnight batch should need — a bad HPCL
+# night has historically produced 50+ restarts and the old cap of 5 meant
+# the bot stopped hours before the operator checked in. The only scenario
+# where 200 isn't enough is a sustained hours-long outage, and in that
+# case a higher cap wouldn't help anyway.
+MAX_AUTO_RESTARTS            = 200
 AUTO_RESTART_WAIT_S          = 30
+# Section 3 of the survivability design: the quiet retry loop runs at most
+# this long before declaring the session genuinely dead and handing off
+# to Section 5's cleanup check. 30 min covers most HPCL flap windows
+# without hiding a truly dead session for so long that the operator
+# wakes up wondering why the batch stopped.
+SESSION_DEAD_QUIET_RETRY_S   = 1800
+# Grace window between the second Ctrl-C and the hard exit. ctx.close()
+# needs a few seconds to flush the persistent chrome profile; killing
+# Playwright mid-close leaves the async close task dangling and HPCL
+# cookies in an undefined state. A third Ctrl-C inside this window
+# hard-exits immediately for the operator who really needs out NOW.
+SHUTDOWN_GRACE_S             = 10
 
 # ---- Idle alert (manual-input watchdog) ----
 # When the bot is blocked on a manual input (OTP prompt, --keep-open pause)
