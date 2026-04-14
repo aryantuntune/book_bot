@@ -140,6 +140,27 @@ class ExcelStore:
         self._atomic_save(self._wb, self.output_path)
         log.info(f"row {row_idx}: cleared for retry")
 
+    def get_attempt_count(self, row_idx: int) -> int:
+        """Read the per-row attempt count from col D. Returns 0 when the
+        cell is empty, missing, or non-integer — old Output workbooks
+        written before this feature have no col D at all, so a missing
+        cell must degrade gracefully to zero."""
+        raw = self._ws.cell(row=row_idx, column=4).value
+        if raw is None:
+            return 0
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
+    def increment_attempt_count(self, row_idx: int) -> int:
+        """Bump col D by 1 and persist. Returns the new count so callers
+        don't need a second read."""
+        new = self.get_attempt_count(row_idx) + 1
+        self._ws.cell(row=row_idx, column=4).value = new
+        self._atomic_save(self._wb, self.output_path)
+        return new
+
     def _ensure_issues_workbook(self) -> None:
         """Lazily create or open the Issues workbook."""
         if self._issues_wb is not None:

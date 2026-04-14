@@ -610,9 +610,29 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
                     elif result.reason == "pending_payment":
                         store.mark_terminal(row_idx, "payment pending")
                     else:
-                        store.write_issue(row_idx, phone, result.reason, result.raw)
-                        if not _is_terminal_issue(result.reason):
-                            transient_rows.append(row_idx)
+                        # Section 4 per-row attempt budget. Terminal reasons
+                        # lock col C immediately — retrying won't change
+                        # HPCL's verdict. Transient reasons get
+                        # MAX_ATTEMPTS_PER_ROW chances across ANY number of
+                        # restarts because the count is persisted in col D.
+                        if _is_terminal_issue(result.reason):
+                            store.write_issue(row_idx, phone, result.reason, result.raw)
+                        else:
+                            new_count = store.increment_attempt_count(row_idx)
+                            if new_count >= config.MAX_ATTEMPTS_PER_ROW:
+                                log.warning(
+                                    f"row {row_idx}: attempt {new_count}/"
+                                    f"{config.MAX_ATTEMPTS_PER_ROW} reached — "
+                                    f"locking as ISSUE ({result.reason})"
+                                )
+                                store.write_issue(row_idx, phone, result.reason, result.raw)
+                            else:
+                                log.info(
+                                    f"row {row_idx}: attempt {new_count}/"
+                                    f"{config.MAX_ATTEMPTS_PER_ROW} failed "
+                                    f"({result.reason}) — leaving pending"
+                                )
+                                transient_rows.append(row_idx)
 
                     log.info(store.progress_line())
 
@@ -683,16 +703,33 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
                             f"the session. If the restart budget is exhausted "
                             f"the batch will exit cleanly."
                         ) from row_e
+                    # Section 4: unexpected exceptions also count against
+                    # the attempt budget. Three unexpected errors on the
+                    # same row => lock as ISSUE.
                     try:
-                        store.write_issue(
-                            row_idx,
-                            phone,
-                            reason=f"unexpected:{type(row_e).__name__}",
-                            raw=str(row_e)[:500],
-                        )
+                        new_count = store.increment_attempt_count(row_idx)
+                        if new_count >= config.MAX_ATTEMPTS_PER_ROW:
+                            log.warning(
+                                f"row {row_idx}: unexpected error on "
+                                f"attempt {new_count}/{config.MAX_ATTEMPTS_PER_ROW} "
+                                f"— locking as ISSUE"
+                            )
+                            store.write_issue(
+                                row_idx,
+                                phone,
+                                reason=f"unexpected:{type(row_e).__name__}",
+                                raw=str(row_e)[:500],
+                            )
+                        else:
+                            log.info(
+                                f"row {row_idx}: unexpected error on "
+                                f"attempt {new_count}/{config.MAX_ATTEMPTS_PER_ROW} "
+                                f"— leaving pending"
+                            )
+                            transient_rows.append(row_idx)
                     except Exception as write_e:
-                        log.error(f"  (could not write issue: {write_e})")
-                    transient_rows.append(row_idx)
+                        log.error(f"  (could not write attempt_count: {write_e})")
+                        transient_rows.append(row_idx)
                     try:
                         if pb is not None:
                             frame = _recover_with_playbook(
@@ -735,14 +772,14 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
                 )
                 break
 
-            # Clear transient ISSUE rows so pending_rows() re-yields them on
-            # the next pass. Terminal rows keep their ISSUE marker.
+            # Transient rows already have col C empty — Section 4's attempt
+            # budget branch left them alone when it bumped col D. So
+            # pending_rows() will yield them again on the next pass for
+            # free. This log line is just a progress marker.
             log.info(
-                f"clearing {len(transient_rows)} transient rows for "
+                f"{len(transient_rows)} transient row(s) will be retried on "
                 f"pass {pass_num + 1}: {transient_rows}"
             )
-            for ridx in transient_rows:
-                store.clear_issue(ridx)
 
         log.info(f"final summary: {store.summary()}")
 

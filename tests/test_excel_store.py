@@ -270,3 +270,36 @@ def test_progress_line_on_empty_file(store_env):
     assert s["pending"] == 0
     line = store.progress_line()
     assert "0/0 done" in line
+
+
+def test_attempt_count_defaults_to_zero_on_fresh_row(store_env):
+    inp = _make_input(store_env, [("C1", "9876543210")])
+    store = ExcelStore(inp)
+    assert store.get_attempt_count(1) == 0
+
+
+def test_attempt_count_increments_and_persists(store_env):
+    inp = _make_input(store_env, [("C1", "9876543210")])
+    store = ExcelStore(inp)
+    assert store.increment_attempt_count(1) == 1
+    assert store.increment_attempt_count(1) == 2
+    assert store.get_attempt_count(1) == 2
+
+    store2 = ExcelStore(inp)  # reload from disk
+    assert store2.get_attempt_count(1) == 2
+
+
+def test_attempt_count_missing_col_d_reads_as_zero(store_env):
+    inp = _make_input(store_env, [("C1", "9876543210")])
+    store = ExcelStore(inp)
+    assert store.get_attempt_count(1) == 0
+
+
+def test_attempt_count_non_integer_col_d_reads_as_zero(store_env):
+    inp = _make_input(store_env, [("C1", "9876543210")])
+    store = ExcelStore(inp)
+    wb = openpyxl.load_workbook(store.output_path)
+    wb.active.cell(row=1, column=4).value = "not a number"
+    wb.save(store.output_path)
+    store2 = ExcelStore(inp)
+    assert store2.get_attempt_count(1) == 0

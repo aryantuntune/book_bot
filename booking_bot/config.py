@@ -49,7 +49,11 @@ RETRY_PAUSE_S         = 2
 GET_FRAME_TIMEOUT_S   = 30
 MAX_NAV_HOPS          = 6
 MAX_STEPS_PER_BOOKING = 5
-MAX_ATTEMPTS_PER_ROW  = 2
+# How many independent Issue outcomes a single row gets before col C is
+# locked to literal "ISSUE" and the row stops appearing in pending_rows().
+# Survives restarts because the count is persisted in col D of the Output
+# workbook.
+MAX_ATTEMPTS_PER_ROW  = 3
 
 # ---- Gateway recovery backoff ----
 # Wait this long after a GatewayError for HPCL's upstream to recover before
