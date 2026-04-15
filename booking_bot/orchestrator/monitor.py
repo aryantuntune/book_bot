@@ -9,6 +9,7 @@ Structured in three pieces so each can be unit-tested independently:
 from __future__ import annotations
 
 import logging
+import shlex
 from datetime import datetime, timezone
 from typing import Iterable
 
@@ -100,3 +101,100 @@ def build_totals_line(hbs: Iterable[Heartbeat]) -> str:
         f"Totals: done={done}/{total} ({pct:.0f}%)  "
         f"issue={issue}  failed_chunks={failed}"
     )
+
+
+def parse_command(line: str) -> tuple[str, dict]:
+    """Parse one line of user input into (action, args).
+
+    Actions:
+      - noop:      blank input
+      - restart:   {chunk_id}
+      - kill:      {chunk_id}
+      - stop:      {source}
+      - start:     {source, input, chunk_size|instances, headed}
+      - detach:    {}
+      - stop_all:  {}
+      - help:      {}
+      - error:     {message}
+    """
+    try:
+        tokens = shlex.split(line.strip())
+    except ValueError:
+        return ("error", {"message": "unbalanced quotes"})
+    if not tokens:
+        return ("noop", {})
+    head, *rest = tokens
+    head = head.lower()
+
+    if head in ("r", "restart"):
+        if len(rest) != 1:
+            return ("error", {"message": "usage: r <chunk-id>"})
+        return ("restart", {"chunk_id": rest[0]})
+
+    if head in ("k", "kill"):
+        if len(rest) != 1:
+            return ("error", {"message": "usage: k <chunk-id>"})
+        return ("kill", {"chunk_id": rest[0]})
+
+    if head == "stop":
+        if len(rest) != 1:
+            return ("error", {"message": "usage: stop <source>"})
+        return ("stop", {"source": rest[0]})
+
+    if head == "q":
+        return ("detach", {})
+    if head == "qq":
+        return ("stop_all", {})
+    if head in ("h", "help", "?"):
+        return ("help", {})
+
+    if head == "start":
+        return _parse_start(rest)
+
+    return ("error", {"message": "unknown command"})
+
+
+def _parse_start(tokens: list[str]) -> tuple[str, dict]:
+    if len(tokens) < 2:
+        return ("error", {
+            "message": "usage: start <source> <input> [--chunk-size N | --instances M] [--headed|--headless]"
+        })
+    source, input_path, *flags = tokens
+    args: dict = {
+        "source": source,
+        "input":  input_path,
+        "chunk_size": None,
+        "instances":  None,
+        "headed": False,
+    }
+    i = 0
+    while i < len(flags):
+        tok = flags[i]
+        if tok == "--chunk-size" and i + 1 < len(flags):
+            try:
+                args["chunk_size"] = int(flags[i + 1])
+            except ValueError:
+                return ("error", {"message": f"--chunk-size expects integer, got {flags[i + 1]}"})
+            i += 2
+            continue
+        if tok == "--instances" and i + 1 < len(flags):
+            try:
+                args["instances"] = int(flags[i + 1])
+            except ValueError:
+                return ("error", {"message": f"--instances expects integer, got {flags[i + 1]}"})
+            i += 2
+            continue
+        if tok == "--headed":
+            args["headed"] = True
+            i += 1
+            continue
+        if tok == "--headless":
+            args["headed"] = False
+            i += 1
+            continue
+        return ("error", {"message": f"unknown flag: {tok}"})
+    if args["chunk_size"] is not None and args["instances"] is not None:
+        return ("error", {"message": "pass only one of --chunk-size / --instances"})
+    if args["chunk_size"] is None and args["instances"] is None:
+        args["chunk_size"] = 500
+    return ("start", args)

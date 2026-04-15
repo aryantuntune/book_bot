@@ -61,3 +61,68 @@ def test_build_totals_line_sums_across_chunks():
     line = monitor.build_totals_line(hbs)
     assert "60" in line  # done
     assert "200" in line  # total
+
+
+def test_parse_command_restart_short_form():
+    cmd = monitor.parse_command("r TEST-001")
+    assert cmd == ("restart", {"chunk_id": "TEST-001"})
+
+
+def test_parse_command_restart_long_form():
+    cmd = monitor.parse_command("restart TEST-001")
+    assert cmd == ("restart", {"chunk_id": "TEST-001"})
+
+
+def test_parse_command_kill():
+    assert monitor.parse_command("k TEST-001") == ("kill", {"chunk_id": "TEST-001"})
+    assert monitor.parse_command("kill TEST-001") == ("kill", {"chunk_id": "TEST-001"})
+
+
+def test_parse_command_stop_source():
+    assert monitor.parse_command("stop ASU") == ("stop", {"source": "ASU"})
+
+
+def test_parse_command_quit_variants():
+    assert monitor.parse_command("q") == ("detach", {})
+    assert monitor.parse_command("qq") == ("stop_all", {})
+
+
+def test_parse_command_help():
+    assert monitor.parse_command("h") == ("help", {})
+    assert monitor.parse_command("help") == ("help", {})
+
+
+def test_parse_command_start_with_chunk_size():
+    action, args = monitor.parse_command(
+        "start ASU Input/ASU.xlsx --chunk-size 500"
+    )
+    assert action == "start"
+    assert args["source"] == "ASU"
+    assert args["input"] == "Input/ASU.xlsx"
+    assert args["chunk_size"] == 500
+    assert args.get("instances") is None
+
+
+def test_parse_command_start_with_instances_and_headed():
+    action, args = monitor.parse_command(
+        "start ASU Input/ASU.xlsx --instances 20 --headed"
+    )
+    assert action == "start"
+    assert args["instances"] == 20
+    assert args["headed"] is True
+
+
+def test_parse_command_start_defaults_to_chunk_size_500():
+    action, args = monitor.parse_command("start ASU Input/ASU.xlsx")
+    assert action == "start"
+    assert args["chunk_size"] == 500
+    assert args["headed"] is False
+
+
+def test_parse_command_unknown_returns_error():
+    assert monitor.parse_command("flibbertigibbet") == ("error", {"message": "unknown command"})
+
+
+def test_parse_command_empty_returns_noop():
+    assert monitor.parse_command("") == ("noop", {})
+    assert monitor.parse_command("   ") == ("noop", {})
