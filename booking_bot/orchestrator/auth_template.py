@@ -157,6 +157,10 @@ def ensure_auth_seeds(
     """
     if not operator_phones:
         raise ValueError("operator_phones must be non-empty")
+    if len(set(operator_phones)) != len(operator_phones):
+        raise ValueError(
+            f"operator_phones contains duplicates: {operator_phones}"
+        )
     max_age_s = float(
         config.AUTH_COOLDOWN_S - config.ORCHESTRATOR_AUTH_SEED_BUFFER_S
     )
@@ -166,10 +170,19 @@ def ensure_auth_seeds(
         seed = _seed_path(source, slot)
 
         if seed.exists() and _auth_fresh(seed, max_age_s=max_age_s):
-            log.info(f"auth seed {source}/{slot}: fresh ({seed})")
-            seeds[slot] = seed
-            _write_seed_phone(source, slot, phone)
-            continue
+            recorded = _read_seed_phone(source, slot)
+            if recorded is None or recorded == phone:
+                log.info(f"auth seed {source}/{slot}: fresh ({seed})")
+                seeds[slot] = seed
+                if recorded is None:
+                    _write_seed_phone(source, slot, phone)
+                continue
+            log.warning(
+                f"auth seed {source}/{slot}: seed is fresh but was authenticated "
+                f"as a different operator ({recorded}); re-seeding for {phone[:3]}XXXXXXX"
+            )
+            shutil.rmtree(seed)
+            # fall through to Path B / Path C below
 
         if slot == "op1":
             main_profile = config.ROOT / ".chromium-profile"

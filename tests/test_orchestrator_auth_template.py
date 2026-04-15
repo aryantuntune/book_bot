@@ -282,6 +282,8 @@ def test_ensure_auth_seeds_path_b_copies_main_to_op1_only(auth_env, monkeypatch)
     seeds = auth_template.ensure_auth_seeds("MULTI", ["9111111111", "9222222222"])
     assert interactive_calls == [("MULTI", "op2", "9222222222")]
     assert (seeds["op1"] / "Default" / "Cookies").read_bytes() == b"main-cookies"
+    assert auth_template._read_seed_phone("MULTI", "op1") == "9111111111"
+    assert auth_template._read_seed_phone("MULTI", "op2") == "9222222222"
 
 
 def test_ensure_auth_seeds_writes_seed_phone_metadata(auth_env, monkeypatch):
@@ -316,3 +318,68 @@ def test_ensure_auth_seed_legacy_wrapper_still_works(auth_env, monkeypatch):
     )
     result = auth_template.ensure_auth_seed("LEGACY")
     assert result == seed
+
+
+def test_ensure_auth_seeds_path_a_phone_mismatch_forces_re_seed(auth_env, monkeypatch):
+    """Path A: fresh seed on disk whose seed_phone.json records a different
+    phone → log warning, rmtree the stale seed, fall through to interactive
+    re-auth for the new phone."""
+    seed = auth_env / ".chromium-profile-MULTI-op1-auth-seed"
+    seed.mkdir(parents=True)
+    (seed / "last_auth.json").write_text(
+        json.dumps({"auth_at_utc": datetime.now(timezone.utc).isoformat()}),
+        encoding="utf-8",
+    )
+    (seed / "seed_phone.json").write_text(
+        json.dumps({"operator_phone": "9999999999"}), encoding="utf-8",
+    )
+
+    interactive_calls = []
+
+    def stub_interactive(source, *, slot, operator_phone=None):
+        interactive_calls.append((source, slot, operator_phone))
+        seed2 = auth_env / f".chromium-profile-{source}-{slot}-auth-seed"
+        seed2.mkdir(parents=True, exist_ok=True)
+        (seed2 / "last_auth.json").write_text(
+            json.dumps({"auth_at_utc": datetime.now(timezone.utc).isoformat()}),
+            encoding="utf-8",
+        )
+        return seed2
+
+    monkeypatch.setattr(auth_template, "_interactive_auth_seed", stub_interactive)
+    auth_template.ensure_auth_seeds("MULTI", ["9111111111"])
+    assert interactive_calls == [("MULTI", "op1", "9111111111")]
+    assert auth_template._read_seed_phone("MULTI", "op1") == "9111111111"
+
+
+def test_ensure_auth_seeds_path_a_phone_match_is_idempotent(auth_env, monkeypatch):
+    """Path A: fresh seed whose seed_phone.json matches the passed phone →
+    no interactive launch, no metadata overwrite. Returns {op1: seed}."""
+    seed = auth_env / ".chromium-profile-MULTI-op1-auth-seed"
+    seed.mkdir(parents=True)
+    (seed / "last_auth.json").write_text(
+        json.dumps({"auth_at_utc": datetime.now(timezone.utc).isoformat()}),
+        encoding="utf-8",
+    )
+    (seed / "seed_phone.json").write_text(
+        json.dumps({"operator_phone": "9111111111"}), encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        auth_template, "_interactive_auth_seed",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("should not launch browser"),
+        ),
+    )
+    seeds = auth_template.ensure_auth_seeds("MULTI", ["9111111111"])
+    assert seeds == {"op1": seed}
+    assert auth_template._read_seed_phone("MULTI", "op1") == "9111111111"
+
+
+def test_ensure_auth_seeds_rejects_duplicate_phones(auth_env):
+    with pytest.raises(ValueError, match="duplicate"):
+        auth_template.ensure_auth_seeds("MULTI", ["9111111111", "9111111111"])
+
+
+def test_ensure_auth_seeds_rejects_empty_list(auth_env):
+    with pytest.raises(ValueError, match="non-empty"):
+        auth_template.ensure_auth_seeds("MULTI", [])
