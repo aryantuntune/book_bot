@@ -383,3 +383,64 @@ def test_ensure_auth_seeds_rejects_duplicate_phones(auth_env):
 def test_ensure_auth_seeds_rejects_empty_list(auth_env):
     with pytest.raises(ValueError, match="non-empty"):
         auth_template.ensure_auth_seeds("MULTI", [])
+
+
+def test_clone_to_chunks_uses_per_chunk_operator_slot(auth_env, monkeypatch):
+    """Each chunk's operator_slot picks which seed its profile is cloned
+    from. Two seeds, six chunks (3 per seed)."""
+    from datetime import datetime, timezone
+
+    for slot, marker in (("op1", b"seed1"), ("op2", b"seed2")):
+        seed = auth_env / f".chromium-profile-MULTI-{slot}-auth-seed"
+        seed.mkdir(parents=True)
+        (seed / "Default").mkdir()
+        (seed / "Default" / "Cookies").write_bytes(marker)
+        (seed / "last_auth.json").write_text(
+            json.dumps({"auth_at_utc": datetime.now(timezone.utc).isoformat()}),
+            encoding="utf-8",
+        )
+
+    def _spec(idx, slot, phone):
+        return ChunkSpec(
+            source="MULTI",
+            chunk_id=f"MULTI-{idx:03d}",
+            chunk_index=idx,
+            input_path=auth_env / "Input" / "chunks" / "MULTI" / f"MULTI-{idx:03d}.xlsx",
+            profile_suffix=f"MULTI-{idx:03d}",
+            heartbeat_path=auth_env / "data" / "runs" / "MULTI" / f"MULTI-{idx:03d}.heartbeat.json",
+            row_count=5,
+            operator_slot=slot,
+            operator_phone=phone,
+        )
+
+    chunks = [
+        _spec(1, "op1", "9111111111"),
+        _spec(2, "op1", "9111111111"),
+        _spec(3, "op1", "9111111111"),
+        _spec(4, "op2", "9222222222"),
+        _spec(5, "op2", "9222222222"),
+        _spec(6, "op2", "9222222222"),
+    ]
+    auth_template.clone_to_chunks("MULTI", chunks)
+    for c in chunks:
+        target = auth_env / f".chromium-profile-{c.profile_suffix}"
+        expected = b"seed1" if c.operator_slot == "op1" else b"seed2"
+        assert (target / "Default" / "Cookies").read_bytes() == expected
+
+
+def test_clone_to_chunks_raises_when_slot_seed_missing(auth_env):
+    """If a chunk's operator_slot has no seed on disk, raise FileNotFoundError
+    naming the missing slot."""
+    chunk = ChunkSpec(
+        source="MULTI",
+        chunk_id="MULTI-001",
+        chunk_index=1,
+        input_path=auth_env / "Input" / "chunks" / "MULTI" / "MULTI-001.xlsx",
+        profile_suffix="MULTI-001",
+        heartbeat_path=auth_env / "data" / "runs" / "MULTI" / "MULTI-001.heartbeat.json",
+        row_count=5,
+        operator_slot="op2",
+        operator_phone="9222222222",
+    )
+    with pytest.raises(FileNotFoundError, match="op2"):
+        auth_template.clone_to_chunks("MULTI", [chunk])

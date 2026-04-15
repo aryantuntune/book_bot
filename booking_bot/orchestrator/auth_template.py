@@ -104,22 +104,34 @@ def _scrub_lock_files(profile_dir: Path) -> None:
 
 
 def clone_to_chunks(source: str, chunks: list[ChunkSpec]) -> None:
-    """Copy the source's auth-seed profile to each chunk's profile dir.
-    Skips chunks whose target already has a fresh `last_auth.json`.
-    Aggregates all failures and raises AuthCloneFailed at the end with
-    the complete list so the operator can see every chunk that broke."""
-    seed = _seed_path(source)
-    if not seed.exists():
-        raise FileNotFoundError(
-            f"auth seed profile missing: {seed}. Run `orchestrator auth "
-            f"--source {source}` first."
-        )
+    """Copy each chunk's operator-slot seed profile to the chunk's own
+    profile dir. Skips chunks whose target already has a fresh
+    `last_auth.json`. Aggregates all failures and raises AuthCloneFailed
+    at the end with the complete list so the operator can see every
+    chunk that broke.
+
+    Raises FileNotFoundError early if any needed slot's seed is missing
+    — fail before starting any clones so we don't leave half-populated
+    state behind."""
+    needed_slots = {c.operator_slot for c in chunks}
+    for slot in needed_slots:
+        seed = _seed_path(source, slot)
+        if not seed.exists():
+            raise FileNotFoundError(
+                f"auth seed missing for {source}/{slot}: {seed}. Run "
+                f"`orchestrator auth --source {source} --operator-phones "
+                f"<list>` first."
+            )
+
     max_age_s = float(config.AUTH_COOLDOWN_S)
     failures: list[tuple[str, str]] = []
     for c in chunks:
+        seed = _seed_path(source, c.operator_slot)
         target = _chunk_profile_path(c.profile_suffix)
         if target.exists() and _auth_fresh(target, max_age_s=max_age_s):
-            log.info(f"chunk {c.chunk_id}: profile already fresh, skipping clone")
+            log.info(
+                f"chunk {c.chunk_id}: profile already fresh, skipping clone"
+            )
             continue
         if target.exists():
             try:
@@ -133,7 +145,10 @@ def clone_to_chunks(source: str, chunks: list[ChunkSpec]) -> None:
             failures.append((c.chunk_id, f"copytree failed: {e}"))
             continue
         _scrub_lock_files(target)
-        log.info(f"chunk {c.chunk_id}: profile cloned from seed")
+        log.info(
+            f"chunk {c.chunk_id}: profile cloned from seed "
+            f"{c.operator_slot}"
+        )
     if failures:
         raise exceptions.AuthCloneFailed(failures=failures)
 
