@@ -234,6 +234,19 @@ def get_chat_frame(page: Page) -> Frame:
             except PWTimeoutError as e:
                 log.warning(f"get_chat_frame: reload {attempt} timed out: {e}")
                 continue
+            except Exception as e:
+                # Playwright can raise a plain Error (not PWTimeoutError) when
+                # the reload is cancelled mid-flight — the classic is
+                # `net::ERR_ABORTED; maybe frame was detached?` after a 502
+                # response body. Treat those the same as a timeout: log,
+                # skip the settle, and let the next kick try again. Without
+                # this catch the raw Playwright Error escapes get_chat_frame
+                # and crashes _run_session_attempt's startup retry loop.
+                log.warning(
+                    f"get_chat_frame: reload {attempt} failed "
+                    f"({type(e).__name__}: {e}); continuing to next kick"
+                )
+                continue
             page.wait_for_timeout(config.PAGE_LOAD_WAIT_S * 1000)
 
         deadline = time.monotonic() + per_attempt_timeout_s
