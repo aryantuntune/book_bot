@@ -1,0 +1,199 @@
+"""Orchestrator entry point. Subcommands: auth, start, monitor, stop,
+status. Stateless — every command reads its state from the filesystem
+(heartbeat JSONs, .start.lock)."""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from booking_bot import config
+from booking_bot.orchestrator import auth_template, heartbeat, monitor, spawner, splitter
+
+log = logging.getLogger("orchestrator.cli")
+
+
+# ---- Internal seams (monkey-patched by tests) ----
+
+def _ensure_auth_seed(source: str) -> Path:
+    return auth_template.ensure_auth_seed(source)
+
+
+def _clone_to_chunks(source: str, chunks: list) -> None:
+    auth_template.clone_to_chunks(source, chunks)
+
+
+def _spawn_chunk(spec, *, headed: bool):
+    return spawner.spawn_chunk(spec, headed=headed)
+
+
+# ---- Parser ----
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="python -m booking_bot.orchestrator")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    start = sub.add_parser("start", help="split, clone auth, spawn chunks")
+    start.add_argument("--source", required=True,
+                       help="operator-chosen source name (alphanumeric, "
+                            "1-28 chars)")
+    start.add_argument("--input", required=True, type=Path,
+                       help="path to the input xlsx to split")
+    parallel = start.add_mutually_exclusive_group()
+    parallel.add_argument("--chunk-size", type=int, default=None)
+    parallel.add_argument("--instances",  type=int, default=None)
+    visibility = start.add_mutually_exclusive_group()
+    visibility.add_argument("--headed", action="store_true")
+    visibility.add_argument("--headless", dest="headed", action="store_false")
+    start.set_defaults(headed=False)
+    start.add_argument("--no-monitor", action="store_true",
+                       help="skip the automatic monitor handoff after spawn")
+
+    auth = sub.add_parser("auth", help="pre-authenticate an auth-seed profile")
+    auth.add_argument("--source", required=True)
+    auth.add_argument("--operator-phone", default=None)
+
+    mon = sub.add_parser("monitor", help="attach the live terminal UI")
+    mon.add_argument("--source", default=None)
+
+    stop_cmd = sub.add_parser("stop", help="stop all chunks of a source")
+    stop_cmd.add_argument("--source", required=True)
+
+    status = sub.add_parser("status", help="one-shot status dump")
+    status.add_argument("--source", default=None)
+    status.add_argument("--json", action="store_true", dest="as_json")
+
+    return ap
+
+
+# ---- Subcommand handlers ----
+
+def _acquire_lock(source: str) -> Path:
+    lock_dir = config.RUNS_DIR / source
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / ".start.lock"
+    if lock_path.exists():
+        try:
+            data = json.loads(lock_path.read_text(encoding="utf-8"))
+            pid = int(data["pid"])
+            if _pid_alive(pid):
+                raise RuntimeError(
+                    f"source {source} is already starting "
+                    f"(pid {pid}, at {data.get('started_at')})"
+                )
+        except (json.JSONDecodeError, KeyError, ValueError):
+            pass
+    lock_path.write_text(json.dumps({
+        "pid": os.getpid(),
+        "started_at": datetime.now(tz=timezone.utc).isoformat(),
+    }), encoding="utf-8")
+    return lock_path
+
+
+def _release_lock(lock_path: Path) -> None:
+    try:
+        lock_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def run_start(
+    *,
+    source: str,
+    input_file: Path,
+    chunk_size: int | None,
+    num_chunks: int | None,
+    headed: bool,
+    no_monitor: bool,
+) -> int:
+    """Top-level start handler. Lock → split → auth seed → clone →
+    spawn. Returns a shell exit code."""
+    if chunk_size is None and num_chunks is None:
+        chunk_size = 500  # default
+
+    lock_path = _acquire_lock(source)
+    try:
+        chunks = splitter.split(
+            source, input_file,
+            chunk_size=chunk_size, num_chunks=num_chunks,
+        )
+        print(f"[orchestrator] split into {len(chunks)} chunks", flush=True)
+
+        _ensure_auth_seed(source)
+        _clone_to_chunks(source, chunks)
+
+        handles = []
+        for spec in chunks:
+            handle = _spawn_chunk(spec, headed=headed)
+            handles.append(handle)
+            time.sleep(0.5)  # gentle stagger so HPCL isn't slammed by 25 simultaneous SSL handshakes
+        print(f"[orchestrator] spawned {len(handles)} chunks", flush=True)
+    finally:
+        _release_lock(lock_path)
+
+    if no_monitor:
+        return 0
+    return monitor.run_monitor(source_filter=source)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if args.command == "start":
+        return run_start(
+            source=args.source, input_file=args.input,
+            chunk_size=args.chunk_size, num_chunks=args.instances,
+            headed=args.headed, no_monitor=args.no_monitor,
+        )
+    if args.command == "auth":
+        path = auth_template.ensure_auth_seed(
+            args.source, operator_phone=args.operator_phone,
+        )
+        print(f"[orchestrator] auth seed ready: {path}")
+        return 0
+    if args.command == "monitor":
+        return monitor.run_monitor(source_filter=args.source)
+    if args.command == "stop":
+        return run_stop(source=args.source)
+    if args.command == "status":
+        return run_status(source=args.source, as_json=args.as_json)
+    ap.error(f"unknown command: {args.command}")
+    return 2
+
+
+def run_stop(*, source: str) -> int:
+    hbs = heartbeat.read_all(config.RUNS_DIR, source=source)
+    killed = 0
+    for hb in hbs:
+        if hb.exit_code is not None or hb.pid <= 0:
+            continue
+        try:
+            import signal
+            os.kill(hb.pid, signal.SIGTERM)
+            killed += 1
+        except OSError as e:
+            log.warning(f"could not kill {hb.chunk_id} pid={hb.pid}: {e}")
+    print(f"[orchestrator] stop: sent SIGTERM to {killed} chunks")
+    return 0
+
+
+def run_status(*, source: str | None, as_json: bool) -> int:
+    hbs = heartbeat.read_all(config.RUNS_DIR, source=source)
+    if as_json:
+        from dataclasses import asdict
+        print(json.dumps([asdict(h) for h in hbs], indent=2))
+        return 0
+    print(monitor.render_once(runs_dir=config.RUNS_DIR, source_filter=source))
+    return 0
