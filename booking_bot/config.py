@@ -127,6 +127,19 @@ SESSION_DEAD_QUIET_RETRY_S   = 1800
 # hard-exits immediately for the operator who really needs out NOW.
 SHUTDOWN_GRACE_S             = 10
 
+# ---- Shared auth (cross-instance cookie transplant) ----
+# Path (relative to config.ROOT) of the JSON file that holds a snapshot of
+# the HPCL session cookies written by whichever instance most recently
+# authenticated. Every instance reads this file at browser launch and on
+# every tick of the quiet-retry poll loop, so a single operator OTP unlocks
+# every parallel instance — and if any instance loses its session mid-run,
+# it'll transparently pick up a fresher cookie written by another.
+SHARED_AUTH_FILENAME         = "shared_auth.json"
+# Refuse to use a shared_auth.json older than this. HPCL's session cookie
+# empirically lives several hours; 24h is a safe outer bound, anything older
+# is almost certainly stale and will just fail at HPCL's session check.
+SHARED_AUTH_MAX_AGE_S        = 24 * 3600
+
 # ---- Idle alert (manual-input watchdog) ----
 # When the bot is blocked on a manual input (OTP prompt, --keep-open pause)
 # for more than IDLE_ALERT_AFTER_S, start beeping the device every
