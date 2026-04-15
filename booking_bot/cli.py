@@ -461,6 +461,7 @@ def main() -> None:
     log.info(f"input file: {args.input_file}")
 
     store = ExcelStore(args.input_file, output_suffix=args.profile_suffix)
+    _write_heartbeat("starting", store)
     log.info(f"initial summary: {store.summary()}")
     log.info(store.progress_line())
 
@@ -509,6 +510,8 @@ def main() -> None:
             )
             time.sleep(config.AUTO_RESTART_WAIT_S)
 
+    final_phase = "completed" if store.summary()["pending"] == 0 else "failed"
+    _write_heartbeat(final_phase, store)
     log.info(f"final summary: {store.summary()}")
     log.info(store.progress_line())
     log.info("booking_bot done")
@@ -845,6 +848,7 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
         consecutive_row_failures = 0
 
         for pass_num in range(1, MAX_PASSES + 1):
+            _write_heartbeat("booking", store)
             pass_start = store.summary()
             log.info(
                 f"=== pass {pass_num}/{MAX_PASSES} starting; "
@@ -858,6 +862,10 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
                 current_row_idx = row_idx
                 phone, err = normalize_phone(raw_phone)
                 current_phone = phone or str(raw_phone)
+                _write_heartbeat(
+                    "booking", store,
+                    current_row_idx=row_idx, current_phone=current_phone,
+                )
 
                 if err:
                     store.write_issue(row_idx, str(raw_phone), err,
@@ -890,6 +898,11 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
                             # re-prompt times out, etc.). When it does, mark
                             # ONLY this row as an issue and move on.
                             try:
+                                _write_heartbeat(
+                                    "recovering", store,
+                                    current_row_idx=row_idx,
+                                    current_phone=current_phone,
+                                )
                                 if pb is not None:
                                     frame = _recover_with_playbook(
                                         page, pb, config.OPERATOR_PHONE, _prompt_otp,
@@ -991,6 +1004,10 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
                                 transient_rows.append(row_idx)
 
                     log.info(store.progress_line())
+                    _write_heartbeat(
+                        "booking", store,
+                        current_row_idx=row_idx, current_phone=current_phone,
+                    )
 
                     # Post-row navigation. Clean Success leaves us on the
                     # customer-phone input (booking_body's tail is Previous
@@ -1025,6 +1042,10 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
                             chat.wait_until_settled(frame)
                         except RECOVERABLE as e:
                             log.warning(f"post-row nav failed after row {row_idx}: {e}")
+                            _write_heartbeat(
+                                "recovering", store,
+                                current_row_idx=row_idx, current_phone=current_phone,
+                            )
                             frame = browser.recover_session(
                                 page, config.OPERATOR_PHONE, _prompt_otp,
                             )
@@ -1171,6 +1192,7 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
         # Any unhandled exception — log the visible chat state so Tier-3
         # tuning doesn't require reproducing the bug to see the buttons.
         log.error(f"UNHANDLED: {type(e).__name__}: {e}")
+        _write_heartbeat("failed", store, last_error=str(e)[:500])
         if frame is not None:
             try:
                 log.error(f"visible state at failure:\n{chat.dump_visible_state(frame)}")
