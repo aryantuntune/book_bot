@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import signal
 import sys
@@ -80,6 +81,76 @@ def normalize_phone(raw: object) -> tuple[str, str | None]:
 _USE_GUI_OTP = False
 _HEADLESS = False
 _PROFILE_SUFFIX: str | None = None
+
+
+# ---- Orchestrator heartbeat integration (env-gated) ----
+# These three env vars are set by orchestrator/spawner.py. When unset
+# (manual runs) _write_heartbeat returns immediately and no files are
+# written anywhere.
+
+_heartbeat_started_at: str | None = None
+
+
+def _write_heartbeat(
+    phase: str,
+    store,
+    *,
+    current_row_idx: int | None = None,
+    current_phone: str | None = None,
+    last_error: str | None = None,
+) -> None:
+    """Write one heartbeat tick for the orchestrator monitor. No-op when
+    BOOKING_BOT_HEARTBEAT_PATH is unset (i.e., running manually)."""
+    from datetime import datetime, timezone
+
+    path_str = os.environ.get("BOOKING_BOT_HEARTBEAT_PATH")
+    if not path_str:
+        return
+
+    from pathlib import Path as _Path
+
+    from booking_bot.orchestrator import heartbeat as _hb
+
+    global _heartbeat_started_at
+    now_iso = datetime.now(tz=timezone.utc).isoformat()
+    if _heartbeat_started_at is None:
+        _heartbeat_started_at = now_iso
+
+    s = store.summary()
+    # store.summary()["done"] includes the issue bucket — disjoint math:
+    rows_total   = s["total"]
+    rows_issue   = s["issue"]
+    rows_done    = s["done"] - rows_issue
+    rows_pending = s["pending"]
+    assert rows_done + rows_issue + rows_pending == rows_total, (
+        f"heartbeat bucket math off: done={rows_done} issue={rows_issue} "
+        f"pending={rows_pending} total={rows_total}"
+    )
+
+    masked_phone: str | None = None
+    if current_phone:
+        masked_phone = _hb.mask_phone(current_phone)
+
+    hb = _hb.Heartbeat(
+        source=os.environ.get("BOOKING_BOT_SOURCE", ""),
+        chunk_id=os.environ.get("BOOKING_BOT_CHUNK_ID", ""),
+        pid=os.getpid(),
+        input_file=str(getattr(store, "input_path", "") or ""),
+        profile_suffix=os.environ.get("BOOKING_BOT_CHUNK_ID", ""),
+        phase=phase,
+        rows_total=rows_total,
+        rows_done=rows_done,
+        rows_issue=rows_issue,
+        rows_pending=rows_pending,
+        current_row_idx=current_row_idx,
+        current_phone=masked_phone,
+        started_at=_heartbeat_started_at,
+        last_activity_at=now_iso,
+        command=list(sys.argv),
+        exit_code=None,
+        last_error=last_error,
+    )
+    _hb.write(_Path(path_str), hb)
 
 
 def _start_idle_alert() -> threading.Event:
