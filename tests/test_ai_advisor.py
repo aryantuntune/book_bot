@@ -515,3 +515,125 @@ def test_fake_client_records_kwargs():
     result = client.messages.create(model="x", messages=[{"role": "user", "content": "hi"}])
     assert client.last_kwargs["model"] == "x"
     assert result.content[0].type == "tool_use"
+
+
+from booking_bot.ai_advisor import consult
+
+
+def test_consult_refuses_operator_auth_state(tmp_path):
+    snap = AdvisorSnapshot(
+        state="NEEDS_OPERATOR_AUTH",
+        enabled_buttons=(),
+        last_bubble_text="please enter your 10 digit mobile",
+        recent_actions=(),
+        empty_input_names=("mobile",),
+        row_hint=None,
+    )
+    store = IncidentStore(tmp_path / "i.jsonl")
+    budget = AdvisorBudget()
+    client = FakeAnthropicClient(response=_fake_tool_use_response("click", "x", "y"))
+    d = consult(snap, store, budget, client=client)
+    assert d is None
+    assert client.last_kwargs is None
+
+
+def test_consult_refuses_operator_otp_state(tmp_path):
+    snap = AdvisorSnapshot(
+        state="NEEDS_OPERATOR_OTP",
+        enabled_buttons=(),
+        last_bubble_text="otp sent",
+        recent_actions=(),
+        empty_input_names=("otp",),
+        row_hint=None,
+    )
+    store = IncidentStore(tmp_path / "i.jsonl")
+    budget = AdvisorBudget()
+    client = FakeAnthropicClient(response=_fake_tool_use_response("click", "x", "y"))
+    assert consult(snap, store, budget, client=client) is None
+    assert client.last_kwargs is None
+
+
+def test_consult_refuses_when_budget_exhausted(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "ADVISOR_MAX_CALLS_PER_SESSION", 1)
+    snap = AdvisorSnapshot(
+        state="UNKNOWN",
+        enabled_buttons=("A",),
+        last_bubble_text="",
+        recent_actions=(),
+        empty_input_names=(),
+        row_hint=None,
+    )
+    store = IncidentStore(tmp_path / "i.jsonl")
+    budget = AdvisorBudget()
+    budget.record_call()
+    assert budget.exhausted()
+    client = FakeAnthropicClient(response=_fake_tool_use_response("click", "A", "y"))
+    assert consult(snap, store, budget, client=client) is None
+    assert client.last_kwargs is None
+
+
+def test_consult_fast_path_uses_stored_incident_without_api_call(tmp_path):
+    path = tmp_path / "incidents.jsonl"
+    _write_incidents(path, [{
+        "key": IncidentStore.make_key("UNKNOWN", ["Make Payment", "Previous Menu"]),
+        "state": "UNKNOWN",
+        "buttons_sorted": ["Make Payment", "Previous Menu"],
+        "last_bubble_excerpt": "payment pending",
+        "chosen_action": {"action": "click", "button_label": "Previous Menu", "reason": "bootstrap: escape"},
+        "outcome": "recovered",
+        "recovered_to_state": "BOOK_FOR_OTHERS_MENU",
+        "source": "bootstrap",
+        "timestamp": "2026-04-15T14:12:33Z",
+        "occurrences": 5,
+    }])
+    snap = AdvisorSnapshot(
+        state="UNKNOWN",
+        enabled_buttons=("Make Payment", "Previous Menu"),
+        last_bubble_text="payment pending",
+        recent_actions=(),
+        empty_input_names=(),
+        row_hint=None,
+    )
+    store = IncidentStore(path)
+    budget = AdvisorBudget()
+    client = FakeAnthropicClient(response=None)
+    d = consult(snap, store, budget, client=client)
+    assert d is not None
+    assert d.action == "click"
+    assert d.button_label == "Previous Menu"
+    assert client.last_kwargs is None
+    assert budget.calls_made == 0
+
+
+def test_consult_fast_path_skips_invalid_stored_incident(tmp_path):
+    """If a stored incident has a button_label that is NOT in the current
+    enabled_buttons, the fast path must fall through. Task 10 stubs the
+    slow path to return None; Task 11 wires it for real."""
+    path = tmp_path / "incidents.jsonl"
+    _write_incidents(path, [{
+        "key": IncidentStore.make_key("UNKNOWN", ["A", "B"]),
+        "state": "UNKNOWN",
+        "buttons_sorted": ["A", "B"],
+        "last_bubble_excerpt": "",
+        "chosen_action": {"action": "click", "button_label": "C", "reason": "stale"},
+        "outcome": "recovered",
+        "recovered_to_state": "MAIN_MENU",
+        "source": "bootstrap",
+        "timestamp": "2026-04-15T00:00:00Z",
+        "occurrences": 1,
+    }])
+    snap = AdvisorSnapshot(
+        state="UNKNOWN",
+        enabled_buttons=("A", "B"),
+        last_bubble_text="",
+        recent_actions=(),
+        empty_input_names=(),
+        row_hint=None,
+    )
+    store = IncidentStore(path)
+    budget = AdvisorBudget()
+    client = FakeAnthropicClient(
+        response=_fake_tool_use_response("click", "A", "fallback")
+    )
+    d = consult(snap, store, budget, client=client)
+    assert d is None

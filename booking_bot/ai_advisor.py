@@ -402,3 +402,76 @@ def build_snapshot(
     return _build_snapshot_from_signals(
         signals, state=state, recent_actions=recent_actions, row_hint=row_hint,
     )
+
+
+_REFUSED_STATES = frozenset({"NEEDS_OPERATOR_AUTH", "NEEDS_OPERATOR_OTP"})
+
+
+def consult(
+    snapshot: AdvisorSnapshot,
+    store: IncidentStore,
+    budget: AdvisorBudget,
+    *,
+    client=None,
+) -> Decision | None:
+    """Ask the advisor what to do about the stuck state described by
+    `snapshot`. Returns a validated Decision, or None if the advisor
+    declined (refusal / budget exhausted / API error / invalid
+    response).
+
+    The caller is responsible for acting on the Decision and for
+    calling budget.record_skip() / budget.record_non_skip_decision()
+    after the action is dispatched.
+
+    `client` is the Anthropic client (or a fake). If None, consult
+    constructs a real anthropic.Anthropic client on demand — but only
+    if ANTHROPIC_API_KEY is set AND the fast path misses.
+    """
+    if not config.ADVISOR_ENABLED:
+        log.info("ai_advisor: disabled via config; advisor declined")
+        return None
+
+    if snapshot.state in _REFUSED_STATES:
+        log.warning(
+            f"ai_advisor: REFUSED state={snapshot.state!r} — "
+            f"survivability spec owns auth/OTP recovery"
+        )
+        return None
+
+    if budget.exhausted():
+        log.warning(
+            f"ai_advisor: budget exhausted "
+            f"(calls={budget.calls_made}/{budget.max_calls} "
+            f"skips={budget.total_skips}/{budget.max_total_skips} "
+            f"consec={budget.consecutive_skips}/{budget.max_consecutive_skips})"
+        )
+        return None
+
+    hit = store.lookup_exact(snapshot.state, snapshot.enabled_buttons)
+    if hit is not None:
+        chosen = hit.get("chosen_action") or {}
+        fast_decision = Decision(
+            action=chosen.get("action", ""),
+            button_label=chosen.get("button_label"),
+            reason=f"fast_path: {chosen.get('reason', '')}",
+        )
+        if validate_decision(fast_decision, snapshot):
+            log.info(
+                f"ai_advisor: path=fast state={snapshot.state!r} "
+                f"buttons={list(snapshot.enabled_buttons)!r} "
+                f"decision={fast_decision.action}/"
+                f"{fast_decision.button_label!r} "
+                f"reason={fast_decision.reason!r} "
+                f"budget={budget.calls_made}/{budget.max_calls} "
+                f"skips={budget.total_skips}/{budget.max_total_skips}"
+            )
+            return fast_decision
+        log.warning(
+            f"ai_advisor: stale fast-path hit for state={snapshot.state!r} "
+            f"(stored label {fast_decision.button_label!r} not in current "
+            f"enabled buttons {list(snapshot.enabled_buttons)!r}); "
+            f"falling through to slow path"
+        )
+
+    # Slow path (Task 11) not yet wired.
+    return None
