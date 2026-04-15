@@ -100,3 +100,65 @@ def test_budget_exhausted_when_total_skip_cap_hit(monkeypatch):
         b.record_non_skip_decision()
     assert b.total_skips == 3
     assert b.exhausted() is True
+
+
+from booking_bot.ai_advisor import validate_decision
+
+
+def _snap(buttons=()):
+    return AdvisorSnapshot(
+        state="UNKNOWN",
+        enabled_buttons=tuple(buttons),
+        last_bubble_text="",
+        recent_actions=(),
+        empty_input_names=(),
+        row_hint=None,
+    )
+
+
+def test_validate_click_with_matching_button_ok():
+    snap = _snap(["Make Payment", "Previous Menu"])
+    d = Decision(action="click", button_label="Previous Menu", reason="x")
+    assert validate_decision(d, snap) is True
+
+
+def test_validate_click_case_insensitive_match_ok():
+    snap = _snap(["Make Payment", "Previous Menu"])
+    d = Decision(action="click", button_label="previous menu", reason="x")
+    assert validate_decision(d, snap) is True
+
+
+def test_validate_click_label_not_in_enabled_buttons_fails():
+    snap = _snap(["Make Payment", "Previous Menu"])
+    d = Decision(action="click", button_label="Main Menu", reason="x")
+    assert validate_decision(d, snap) is False
+
+
+def test_validate_click_with_none_button_label_fails():
+    snap = _snap(["A", "B"])
+    d = Decision(action="click", button_label=None, reason="x")
+    assert validate_decision(d, snap) is False
+
+
+def test_validate_reload_always_ok():
+    snap = _snap([])
+    d = Decision(action="reload", button_label=None, reason="x")
+    assert validate_decision(d, snap) is True
+
+
+def test_validate_skip_row_always_ok():
+    snap = _snap([])
+    d = Decision(action="skip_row", button_label=None, reason="x")
+    assert validate_decision(d, snap) is True
+
+
+def test_validate_invalid_action_fails():
+    snap = _snap([])
+    d = Decision(action="typo_action", button_label=None, reason="x")  # type: ignore[arg-type]
+    assert validate_decision(d, snap) is False
+
+
+def test_validate_empty_reason_fails():
+    snap = _snap(["A"])
+    d = Decision(action="reload", button_label=None, reason="")
+    assert validate_decision(d, snap) is False

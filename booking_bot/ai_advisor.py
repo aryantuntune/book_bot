@@ -102,3 +102,37 @@ class AdvisorBudget:
             or self.consecutive_skips >= self.max_consecutive_skips
             or self.total_skips >= self.max_total_skips
         )
+
+
+_ALLOWED_ACTIONS = frozenset({"click", "reload", "skip_row"})
+
+
+def validate_decision(decision: Decision, snapshot: AdvisorSnapshot) -> bool:
+    """Safety choke point. Every code path that produces a Decision —
+    fast path, slow path, or any test fake — routes through this
+    function before the decision is acted on.
+
+    Rules enforced:
+      1. action must be one of {click, reload, skip_row}.
+      2. reason must be a non-empty string (a decision without a reason
+         is almost certainly a malformed response we should reject).
+      3. For action=='click': button_label must be non-None AND must
+         case-insensitively exact-match one of snapshot.enabled_buttons.
+         This is the invariant that makes label hallucination impossible
+         to turn into a real click.
+
+    Returns True if the decision is safe to act on, False otherwise.
+    Never raises.
+    """
+    if decision.action not in _ALLOWED_ACTIONS:
+        return False
+    if not decision.reason or not decision.reason.strip():
+        return False
+    if decision.action == "click":
+        if decision.button_label is None:
+            return False
+        label = decision.button_label.strip().lower()
+        enabled_lower = {b.strip().lower() for b in snapshot.enabled_buttons}
+        if label not in enabled_lower:
+            return False
+    return True
