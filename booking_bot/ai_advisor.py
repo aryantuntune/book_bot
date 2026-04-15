@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from booking_bot import config
+
 
 @dataclass(frozen=True)
 class AdvisorSnapshot:
@@ -55,3 +57,48 @@ class Decision:
     action: Literal["click", "reload", "skip_row"]
     button_label: str | None
     reason: str
+
+
+class AdvisorBudget:
+    """Per-session cost cap for the advisor. Reads its limits from
+    config at construction time; monkeypatching config in tests works
+    as expected.
+
+    Semantics:
+      - record_call() is called by consult() *only* when an API call
+        is actually made. Fast-path hits (exact-match lookup in the
+        incident store) do not increment calls_made — they are free.
+      - record_skip() is called after a skip_row decision is acted on
+        by the caller. Increments both total and consecutive counters.
+      - record_non_skip_decision() is called after a click or reload
+        decision is acted on. Resets the consecutive streak counter
+        but leaves the total alone.
+      - exhausted() is True if any of the three caps are hit. Once
+        exhausted, consult() refuses further API calls and returns
+        None, and the bot falls back to existing crash semantics.
+    """
+
+    def __init__(self):
+        self.calls_made = 0
+        self.total_skips = 0
+        self.consecutive_skips = 0
+        self.max_calls = config.ADVISOR_MAX_CALLS_PER_SESSION
+        self.max_consecutive_skips = config.ADVISOR_MAX_CONSECUTIVE_SKIPS
+        self.max_total_skips = config.ADVISOR_MAX_TOTAL_SKIPS
+
+    def record_call(self) -> None:
+        self.calls_made += 1
+
+    def record_skip(self) -> None:
+        self.total_skips += 1
+        self.consecutive_skips += 1
+
+    def record_non_skip_decision(self) -> None:
+        self.consecutive_skips = 0
+
+    def exhausted(self) -> bool:
+        return (
+            self.calls_made >= self.max_calls
+            or self.consecutive_skips >= self.max_consecutive_skips
+            or self.total_skips >= self.max_total_skips
+        )
