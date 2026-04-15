@@ -504,38 +504,106 @@ def _quiet_retry_until_alive_or_dead(page, pb, store) -> str:
     That is the single behavioural difference from the old recovery path
     and the only reason the 3-hour cooldown is safe.
     """
+    # Poll-only quiet retry: NEVER call page.reload() during this loop. The
+    # old 60s reload cadence was wiping manual operator re-auths — operator
+    # typed an OTP, HPCL accepted, 60 seconds later our reload destroyed the
+    # freshly-issued session cookie and the chat flipped back to the login
+    # screen. Polling detect_state on the live frame lets a manual auth take
+    # effect the moment it lands (MAIN_MENU / READY_FOR_CUSTOMER transitions
+    # are visible in the existing DOM without any reload). We trade away
+    # HPCL's rare server-side self-heal (which required a reload to observe)
+    # in exchange for not sabotaging operator recovery, which is the far more
+    # common outcome during a cooldown-gated quiet retry.
     log.warning(
-        f"quiet retry mode: reloading every 60s for up to "
-        f"{config.SESSION_DEAD_QUIET_RETRY_S}s — NO phone/OTP typing. "
-        f"Triggered because auth cooldown is still active."
+        f"quiet retry mode: polling every 3s for up to "
+        f"{config.SESSION_DEAD_QUIET_RETRY_S}s — NO phone/OTP typing, "
+        f"NO page reload (unless a newer shared_auth.json appears). "
+        f"Operator can manually authenticate in the browser window and "
+        f"the bot will resume automatically; a parallel instance "
+        f"finishing its own auth will also unblock this one."
     )
     deadline = time.monotonic() + config.SESSION_DEAD_QUIET_RETRY_S
-    reload_interval_s = 60.0
+    poll_interval_s = 3.0
     alive_states = ("READY_FOR_CUSTOMER", "MAIN_MENU", "BOOK_FOR_OTHERS_MENU")
+    last_logged_state: str | None = None
+    # Seed the shared-auth-seen marker with whatever the file has right now
+    # so we don't immediately re-inject on the first poll (start_browser
+    # already injected this version). We'll only re-inject when another
+    # instance writes a NEWER shared_auth.json timestamp.
+    initial_shared = browser.read_shared_auth_state()
+    last_shared_written_at: str | None = (
+        initial_shared.get("written_at_utc") if initial_shared else None
+    )
 
     while time.monotonic() < deadline:
         if _should_stop:
             log.warning("quiet retry: Ctrl-C received; exiting early")
             return "needs_otp"
+        # Option B: watch shared_auth.json for fresher cookies from another
+        # parallel instance. When a newer write lands, inject + reload once
+        # so this instance can piggyback on that auth without prompting the
+        # operator. The reload here is justified because it's grabbing a
+        # NEWLY AVAILABLE session, not wiping one — and the next poll
+        # iteration will re-check state, so if the injection worked the
+        # alive-state check fires immediately after.
         try:
-            browser.reset_gateway_flag()
-            page.reload(wait_until="domcontentloaded", timeout=60_000)
-            page.wait_for_timeout(config.PAGE_LOAD_WAIT_S * 1000)
-            frame = browser.get_chat_frame(page)
+            shared = browser.read_shared_auth_state()
+            if shared and shared.get("written_at_utc") != last_shared_written_at:
+                log.info(
+                    f"quiet retry: newer shared_auth.json detected "
+                    f"(written_at={shared.get('written_at_utc')}); "
+                    f"injecting cookies and reloading once"
+                )
+                last_shared_written_at = shared.get("written_at_utc")
+                try:
+                    page.context.add_cookies(shared["cookies"])
+                except Exception as e:
+                    log.warning(
+                        f"quiet retry: add_cookies failed "
+                        f"({type(e).__name__}: {e})"
+                    )
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=60_000)
+                    page.wait_for_timeout(config.PAGE_LOAD_WAIT_S * 1000)
+                except Exception as e:
+                    log.warning(
+                        f"quiet retry: reload after shared-auth inject "
+                        f"failed ({type(e).__name__}: {e})"
+                    )
+        except Exception as e:
+            log.debug(
+                f"quiet retry: shared-auth check error: "
+                f"{type(e).__name__}: {e}"
+            )
+        try:
+            frame = page.main_frame
             state = chat.detect_state(frame)
-            log.info(f"quiet retry: state={state!r}")
+            # Throttle state logging: only log when it changes, so a long
+            # wait doesn't flood the log with identical NEEDS_OPERATOR_AUTH
+            # lines but still shows every real transition.
+            if state != last_logged_state:
+                log.info(f"quiet retry: state={state!r}")
+                last_logged_state = state
             if state in alive_states:
-                log.info("quiet retry: session alive — resuming")
+                log.info(
+                    "quiet retry: session alive — resuming "
+                    "(operator manual auth, shared-auth transplant, or "
+                    "HPCL self-heal)"
+                )
+                # If we just transplanted a working cookie, persist our
+                # own auth timestamp so this instance participates in the
+                # 20h cooldown protection going forward.
+                browser.mark_auth_success()
                 return "alive"
         except Exception as e:
-            log.warning(
-                f"quiet retry tick failed: {type(e).__name__}: {e} — "
+            log.debug(
+                f"quiet retry poll error: {type(e).__name__}: {e} — "
                 f"continuing to wait"
             )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        time.sleep(min(reload_interval_s, remaining))
+        time.sleep(min(poll_interval_s, remaining))
 
     log.warning(
         f"quiet retry: {config.SESSION_DEAD_QUIET_RETRY_S}s elapsed without "

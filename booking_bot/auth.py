@@ -86,6 +86,42 @@ def login_if_needed(
     log.info(f"login_if_needed: detected state={state!r}")
 
     if state in ("NEEDS_OPERATOR_AUTH", "NEEDS_OPERATOR_OTP"):
+        # Option B of the shared-auth design: before deciding to enter the
+        # cooldown-wait quiet retry, see if another instance has posted a
+        # fresher cookie snapshot to shared_auth.json. If so, inject it,
+        # reload once, and re-detect — we may land on MAIN_MENU and skip
+        # both the OTP dance AND the 30-min quiet retry entirely.
+        shared = browser.read_shared_auth_state()
+        if shared:
+            injected = browser.inject_shared_auth_cookies(frame.page.context)
+            if injected:
+                try:
+                    log.info(
+                        "login_if_needed: reloading once after shared-auth "
+                        "injection to pick up the transplanted session"
+                    )
+                    frame.page.reload(wait_until="domcontentloaded", timeout=60_000)
+                    frame.page.wait_for_timeout(config.PAGE_LOAD_WAIT_S * 1000)
+                    new_state = _wait_for_known_state(frame)
+                    log.info(f"post-shared-auth state={new_state!r}")
+                    if new_state not in (
+                        "NEEDS_OPERATOR_AUTH",
+                        "NEEDS_OPERATOR_OTP",
+                        "UNKNOWN",
+                    ):
+                        # Shared cookie was still valid — we're in.
+                        browser.mark_auth_success()
+                        browser.write_shared_auth_state(frame.page)
+                        return "authed"
+                    # Shared cookie was stale, HPCL still wants auth.
+                    # Fall through to the existing cooldown check.
+                    state = new_state
+                except Exception as e:
+                    log.warning(
+                        f"login_if_needed: shared-auth reload failed "
+                        f"({type(e).__name__}: {e}); falling through to "
+                        f"normal auth flow"
+                    )
         age = browser.last_auth_age_s()
         if age is not None and age < config.AUTH_COOLDOWN_S:
             log.warning(
@@ -113,6 +149,7 @@ def login_if_needed(
         chat.send_text(frame, otp)
         chat.wait_until_settled(frame)
         browser.mark_auth_success()
+        browser.write_shared_auth_state(frame.page)
         return "authed_freshly"
     elif state == "NEEDS_OPERATOR_OTP":
         otp = get_otp()
@@ -120,10 +157,12 @@ def login_if_needed(
         chat.send_text(frame, otp)
         chat.wait_until_settled(frame)
         browser.mark_auth_success()
+        browser.write_shared_auth_state(frame.page)
         return "authed_freshly"
     else:
         log.info("session already active; skipping operator auth")
         browser.mark_auth_success()
+        browser.write_shared_auth_state(frame.page)
         return "authed"
 
 
@@ -141,6 +180,7 @@ def full_auth(frame: Frame, operator_phone: str, get_otp: Callable[[], str]) -> 
     chat.send_text(frame, otp)
     chat.wait_until_settled(frame)
     browser.mark_auth_success()
+    browser.write_shared_auth_state(frame.page)
 
     navigate_to_book_for_others(frame)
 

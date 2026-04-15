@@ -109,6 +109,142 @@ def last_auth_age_s() -> float | None:
         return None
 
 
+# ---- Shared auth (cross-instance cookie transplant) ---------------------
+#
+# The three functions below implement the shared_auth.json protocol that
+# lets parallel booking_bot instances share a single operator OTP:
+#
+#   1. After any instance completes operator auth, `write_shared_auth_state`
+#      snapshots the current page-context's HPCL cookies and writes them
+#      atomically to config.ROOT / shared_auth.json with a UTC timestamp.
+#   2. `read_shared_auth_state` parses the file, validates freshness
+#      against SHARED_AUTH_MAX_AGE_S, and returns the payload — tolerating
+#      missing, stale, corrupt, or mid-write files.
+#   3. `inject_shared_auth_cookies` calls add_cookies() on a live
+#      BrowserContext so the cookies apply to the next navigation.
+#
+# start_browser() calls inject() once between context creation and the
+# first HPCL goto, so a fresh launch with a valid shared_auth.json skips
+# operator auth entirely. The quiet-retry poll loop in cli.py also watches
+# the file for newer writes and re-injects mid-run, so a single successful
+# re-auth by any instance propagates to every other instance in ~3 seconds
+# (Option B of the design).
+#
+# This is one-way trust: we never verify the cookie is still valid before
+# injecting. If HPCL has invalidated it, the post-injection detect_state
+# falls through to NEEDS_OPERATOR_AUTH and the normal login path runs,
+# which will re-write shared_auth.json on success.
+
+
+def _shared_auth_path() -> Path:
+    """Disk location of the shared auth JSON. At config.ROOT so suffixed
+    profile dirs and the unsuffixed profile all read/write the same file
+    (the single point of cross-instance sync for this laptop)."""
+    return Path(config.ROOT) / config.SHARED_AUTH_FILENAME
+
+
+def write_shared_auth_state(page: Page) -> None:
+    """Snapshot the current page-context's HPCL cookies and write them to
+    shared_auth.json atomically. Called by auth.py after every successful
+    operator login so other parallel instances can skip their own OTP.
+
+    Atomic write via <path>.tmp + os.replace — the NTFS rename is atomic
+    for same-FS replaces, so a reader never sees a half-written file.
+
+    Never raises: a failed write only costs us the cross-instance sync for
+    this particular auth event, not the auth itself."""
+    try:
+        ctx = page.context
+        all_cookies = ctx.cookies()
+        # Filter to HPCL-origin cookies only. No point exporting unrelated
+        # cookies (ads, analytics) — they're dead weight and bloat the file.
+        hpcl_cookies = [
+            c for c in all_cookies
+            if "hpchatbot.hpcl.co.in" in (c.get("domain") or "")
+            or "hpcl.co.in" in (c.get("domain") or "")
+        ]
+        payload = {
+            "written_at_utc": datetime.now(timezone.utc).isoformat(),
+            "origin": "https://hpchatbot.hpcl.co.in",
+            "cookies": hpcl_cookies,
+        }
+        path = _shared_auth_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload))
+        os.replace(tmp, path)
+        log.info(
+            f"wrote {config.SHARED_AUTH_FILENAME}: {len(hpcl_cookies)} HPCL "
+            f"cookie(s) available for other parallel instances"
+        )
+    except Exception as e:
+        log.warning(
+            f"write_shared_auth_state failed: {type(e).__name__}: {e} — "
+            f"parallel instances will still work but won't share this auth"
+        )
+
+
+def read_shared_auth_state() -> dict | None:
+    """Read shared_auth.json. Returns the parsed dict if it exists, is
+    well-formed, and is less than SHARED_AUTH_MAX_AGE_S old. Returns None
+    otherwise. Safe to call from any instance at any time — retries on
+    PermissionError (another instance may be mid os.replace on Windows)
+    and swallows corruption as a None return so a bad file never crashes
+    the bot."""
+    path = _shared_auth_path()
+    for attempt in range(3):
+        try:
+            if not path.exists():
+                return None
+            raw = path.read_text()
+        except PermissionError:
+            # Windows: os.replace from another writer briefly blocks us.
+            time.sleep(0.1)
+            continue
+        except OSError:
+            return None
+        try:
+            payload = json.loads(raw)
+            written_at = datetime.fromisoformat(payload["written_at_utc"])
+            age = (datetime.now(timezone.utc) - written_at).total_seconds()
+            if age < 0 or age > config.SHARED_AUTH_MAX_AGE_S:
+                return None
+            cookies = payload.get("cookies")
+            if not isinstance(cookies, list) or not cookies:
+                return None
+            return payload
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return None
+    return None
+
+
+def inject_shared_auth_cookies(context: BrowserContext) -> int:
+    """Inject cookies from shared_auth.json into the given context if any
+    are available and fresh. Returns the number of cookies actually
+    injected (0 if the file is missing, stale, corrupt, or add_cookies
+    itself failed). Prints a visible INFO line on success so the operator
+    can confirm the cross-instance share is live."""
+    shared = read_shared_auth_state()
+    if not shared:
+        return 0
+    cookies = shared["cookies"]
+    try:
+        context.add_cookies(cookies)
+    except Exception as e:
+        log.warning(
+            f"inject_shared_auth_cookies: add_cookies failed "
+            f"({type(e).__name__}: {e}); falling back to normal auth"
+        )
+        return 0
+    log.info(
+        f"injected {len(cookies)} shared HPCL cookie(s) from "
+        f"{config.SHARED_AUTH_FILENAME} "
+        f"(written_at={shared.get('written_at_utc')}) — "
+        f"attempting to skip operator auth this run"
+    )
+    return len(cookies)
+
+
 def clear_auth_cooldown() -> None:
     """Delete the persisted auth timestamp so the next login_if_needed
     call will accept a phone/OTP submission. Called ONLY from the
@@ -183,6 +319,15 @@ def start_browser(
     }
     if use_system_chrome:
         launch_kwargs["channel"] = "chrome"
+    else:
+        # HPCL's PWA stalls on first load in bundled Chromium when Playwright's
+        # default automation flags are present — navigator.webdriver=true and
+        # --enable-automation trip the site's service worker, #scroller stays
+        # empty, bot reloads forever. Strip them for bundled chromium runs.
+        launch_kwargs["ignore_default_args"] = ["--enable-automation"]
+        launch_kwargs["args"] = [
+            "--disable-blink-features=AutomationControlled",
+        ]
     try:
         ctx = pw.chromium.launch_persistent_context(**launch_kwargs)
     except Exception as launch_err:
@@ -243,6 +388,13 @@ def start_browser(
     log.info(
         f"browser launched ({mode}, {channel}, profile={profile_dir.name})"
     )
+    # Shared-auth cookie transplant: before the first HPCL navigation,
+    # inject any cookies written by a previously-authed parallel instance.
+    # If this is a fresh laptop (no shared_auth.json) or the file is stale,
+    # this is a no-op and the normal OTP flow runs. If cookies are injected
+    # and still valid on HPCL's side, the next detect_state lands straight
+    # on MAIN_MENU / READY_FOR_CUSTOMER and login_if_needed becomes a nop.
+    inject_shared_auth_cookies(ctx)
     log.info(f"navigating to {config.URL}")
     page.goto(config.URL, wait_until="domcontentloaded", timeout=60_000)
     page.wait_for_timeout(config.PAGE_LOAD_WAIT_S * 1000)
