@@ -5,8 +5,7 @@ ChunkSpecs. ensure_auth_seed's interactive path (Path C) is NOT tested
 here — it needs a real browser; tests stub out _interactive_auth_seed
 so paths A and B can be tested without touching Playwright."""
 import json
-import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -33,7 +32,6 @@ def _make_seed_profile(root: Path, source: str, *, fresh: bool = True) -> Path:
     (seed / "Default" / "Cookies").write_bytes(b"fake-cookie-db")
     (seed / "SingletonLock").write_text("fake-lock")
     (seed / "SingletonCookie").write_text("fake-cookie-lock")
-    from datetime import datetime, timedelta, timezone
     delta = timedelta(hours=1) if fresh else timedelta(hours=30)
     written_at = datetime.now(timezone.utc) - delta
     (seed / "last_auth.json").write_text(
@@ -167,7 +165,6 @@ def test_ensure_auth_seed_path_a_stale_seed_falls_through(auth_env, monkeypatch)
 def test_auth_fresh_accepts_real_browser_format(auth_env):
     """Regression: browser.py writes {'auth_at_utc': ISO}, not
     {'timestamp': float}. _auth_fresh must recognize the real format."""
-    from datetime import datetime, timezone
     seed = auth_env / ".chromium-profile-REAL-auth-seed"
     seed.mkdir(parents=True)
     (seed / "last_auth.json").write_text(
@@ -178,7 +175,6 @@ def test_auth_fresh_accepts_real_browser_format(auth_env):
 
 
 def test_auth_fresh_rejects_stale_auth_at_utc(auth_env):
-    from datetime import datetime, timedelta, timezone
     seed = auth_env / ".chromium-profile-STALE-auth-seed"
     seed.mkdir(parents=True)
     old = datetime.now(timezone.utc) - timedelta(hours=25)

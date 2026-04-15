@@ -36,17 +36,17 @@ def _auth_fresh(profile_dir: Path, *, max_age_s: float) -> bool:
     """True iff profile_dir/last_auth.json exists, parses, and is less than
     max_age_s old. Expects the browser.py write format:
     {"auth_at_utc": "<ISO-8601 UTC timestamp>"}. Any other shape (missing
-    key, wrong type, malformed JSON) collapses to False — callers fall
-    through to a fresh interactive auth in that case."""
+    key, wrong type, malformed JSON, naive datetime) collapses to False —
+    callers fall through to a fresh interactive auth in that case."""
     last_auth = profile_dir / "last_auth.json"
     if not last_auth.exists():
         return False
     try:
         data = json.loads(last_auth.read_text(encoding="utf-8"))
         written_at = datetime.fromisoformat(data["auth_at_utc"])
+        age_s = (datetime.now(timezone.utc) - written_at).total_seconds()
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         return False
-    age_s = (datetime.now(timezone.utc) - written_at).total_seconds()
     return 0 <= age_s < max_age_s
 
 
