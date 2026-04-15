@@ -400,3 +400,63 @@ def test_incident_store_flush_is_atomic(tmp_path, monkeypatch):
     )
     tmp_files = list(tmp_path.glob("*.tmp"))
     assert tmp_files == []
+
+
+from booking_bot.ai_advisor import _build_snapshot_from_signals
+
+
+def test_build_snapshot_from_signals_basic():
+    signals = {
+        "buttons": ["Make Payment", "Previous Menu"],
+        "lastBubbleText": "Your booking is pending payment. Please complete payment first.",
+        "emptyInputNames": [],
+    }
+    snap = _build_snapshot_from_signals(
+        signals,
+        state="UNKNOWN",
+        recent_actions=["clicked Book for Others", "typed 9876543210"],
+        row_hint="row 42/500",
+    )
+    assert snap.state == "UNKNOWN"
+    assert snap.enabled_buttons == ("Make Payment", "Previous Menu")
+    assert "pending payment" in snap.last_bubble_text
+    assert snap.recent_actions == ("clicked Book for Others", "typed 9876543210")
+    assert snap.empty_input_names == ()
+    assert snap.row_hint == "row 42/500"
+
+
+def test_build_snapshot_truncates_long_bubble_text():
+    signals = {
+        "buttons": [],
+        "lastBubbleText": "x" * 900,
+        "emptyInputNames": ["mobile"],
+    }
+    snap = _build_snapshot_from_signals(
+        signals, state="UNKNOWN", recent_actions=[], row_hint=None,
+    )
+    assert len(snap.last_bubble_text) == 500
+
+
+def test_build_snapshot_limits_recent_actions_to_5():
+    signals = {"buttons": [], "lastBubbleText": "", "emptyInputNames": []}
+    actions = [f"action {i}" for i in range(20)]
+    snap = _build_snapshot_from_signals(
+        signals, state="UNKNOWN", recent_actions=actions, row_hint=None,
+    )
+    assert len(snap.recent_actions) == 5
+    assert snap.recent_actions[-1] == "action 19"
+
+
+def test_build_snapshot_coerces_nulls_to_empty():
+    signals = {
+        "buttons": None,
+        "lastBubbleText": None,
+        "emptyInputNames": None,
+    }
+    snap = _build_snapshot_from_signals(
+        signals, state="UNKNOWN", recent_actions=None, row_hint=None,
+    )
+    assert snap.enabled_buttons == ()
+    assert snap.last_bubble_text == ""
+    assert snap.empty_input_names == ()
+    assert snap.recent_actions == ()

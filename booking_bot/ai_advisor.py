@@ -320,3 +320,85 @@ class IncidentStore:
                 except OSError:
                     pass
             raise
+
+
+_MAX_BUBBLE_CHARS = 500
+_MAX_RECENT_ACTIONS = 5
+
+
+def _build_snapshot_from_signals(
+    signals: dict,
+    state: str,
+    recent_actions,
+    row_hint: str | None,
+) -> AdvisorSnapshot:
+    """Pure helper — the thin adapter from a raw signals dict (produced
+    by either detect_state's JS eval or a hand-crafted test fixture)
+    to a typed AdvisorSnapshot. All coercion, truncation, and
+    normalization lives here so it's trivially unit-testable without
+    a Playwright frame."""
+    buttons = tuple(signals.get("buttons") or [])
+    bubble = (signals.get("lastBubbleText") or "")[:_MAX_BUBBLE_CHARS]
+    empty_names = tuple(signals.get("emptyInputNames") or [])
+    actions_list = list(recent_actions or [])
+    if len(actions_list) > _MAX_RECENT_ACTIONS:
+        actions_list = actions_list[-_MAX_RECENT_ACTIONS:]
+    return AdvisorSnapshot(
+        state=state,
+        enabled_buttons=buttons,
+        last_bubble_text=bubble,
+        recent_actions=tuple(actions_list),
+        empty_input_names=empty_names,
+        row_hint=row_hint,
+    )
+
+
+def build_snapshot(
+    frame,
+    state: str,
+    recent_actions,
+    row_hint: str | None,
+) -> AdvisorSnapshot:
+    """Read the current frame state and construct an AdvisorSnapshot.
+    Uses a single JS evaluate() call with the same selectors as
+    chat.detect_state, so what the advisor sees is what detect_state
+    saw."""
+    js = f"""
+    () => {{
+      const btns = Array.from(document.querySelectorAll('{config.SEL_OPTION}'))
+        .filter(b => b.offsetParent !== null && !b.disabled)
+        .map(b => (b.innerText || '').trim());
+      const inputs = Array.from(document.querySelectorAll(
+        "input[type='text'], input[type='number'], input[type='tel'], input[type='password']"
+      )).filter(el => {{
+        if (el.offsetParent === null) return false;
+        if (el.disabled || el.readOnly) return false;
+        const cls = el.getAttribute('class') || '';
+        if (cls.includes('replybox')) return false;
+        if (el.value && el.value.trim().length > 0) return false;
+        return true;
+      }});
+      const emptyInputNames = inputs.map(el =>
+        (el.getAttribute('name') || el.id || '').trim()
+      ).filter(n => n.length > 0);
+      const s = document.querySelector('{config.SEL_SCROLLER}');
+      let lastBubbleText = '';
+      if (s) {{
+        const kids = Array.from(s.children);
+        for (let i = kids.length - 1; i >= 0; i--) {{
+          const t = (kids[i].innerText || '').trim();
+          if (t) {{ lastBubbleText = t; break; }}
+        }}
+        if (!lastBubbleText) lastBubbleText = (s.innerText || '').slice(-400);
+      }}
+      return {{buttons: btns, lastBubbleText: lastBubbleText, emptyInputNames: emptyInputNames}};
+    }}
+    """
+    try:
+        signals = frame.evaluate(js) or {}
+    except Exception as e:
+        log.warning(f"build_snapshot: frame.evaluate failed ({e}); using empty signals")
+        signals = {}
+    return _build_snapshot_from_signals(
+        signals, state=state, recent_actions=recent_actions, row_hint=row_hint,
+    )
