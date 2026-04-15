@@ -808,3 +808,80 @@ def test_consult_slow_path_passes_top_k_similar_as_few_shots(tmp_path):
     msgs = client.last_kwargs["messages"]
     combined = json.dumps(msgs)
     assert "an old incident" in combined
+
+
+from booking_bot.ai_advisor import apply_advisor_decision
+from booking_bot.exceptions import AdvisorSkipRow
+
+
+class FakeFrame:
+    """Captures click_by_action calls. Matches playbook._click_by_action's
+    expected Frame shape only enough for the test."""
+    def __init__(self):
+        self.clicks = []
+
+
+class FakePage:
+    def __init__(self):
+        self.reloaded = False
+
+
+def test_apply_decision_click_invokes_click_by_action(monkeypatch):
+    calls = []
+    def fake_click_by_action(frame, action):
+        calls.append((frame, action.kind, action.button_text))
+    import booking_bot.playbook as pb_mod
+    monkeypatch.setattr(pb_mod, "_click_by_action", fake_click_by_action)
+
+    frame = FakeFrame()
+    page = FakePage()
+    decision = Decision(action="click", button_label="Previous Menu", reason="escape")
+    budget = AdvisorBudget()
+
+    result = apply_advisor_decision(decision, frame, page, budget=budget)
+    assert result == "acted"
+    assert calls == [(frame, "click", "Previous Menu")]
+    assert budget.consecutive_skips == 0
+
+
+def test_apply_decision_reload_calls_page_reload(monkeypatch):
+    frame = FakeFrame()
+    page = FakePage()
+    def fake_reload(**kwargs):
+        page.reloaded = True
+    page.reload = fake_reload
+    page.wait_for_timeout = lambda ms: None
+
+    decision = Decision(action="reload", button_label=None, reason="dom broken")
+    budget = AdvisorBudget()
+
+    result = apply_advisor_decision(decision, frame, page, budget=budget)
+    assert result == "acted"
+    assert page.reloaded is True
+    assert budget.consecutive_skips == 0
+
+
+def test_apply_decision_skip_row_raises_advisor_skip_row(monkeypatch):
+    frame = FakeFrame()
+    page = FakePage()
+    decision = Decision(action="skip_row", button_label=None, reason="payment pending")
+    budget = AdvisorBudget()
+
+    try:
+        apply_advisor_decision(decision, frame, page, budget=budget)
+    except AdvisorSkipRow as e:
+        assert str(e) == "payment pending"
+    else:
+        raise AssertionError("expected AdvisorSkipRow to be raised")
+    assert budget.total_skips == 1
+    assert budget.consecutive_skips == 1
+
+
+def test_apply_decision_invalid_action_returns_declined(monkeypatch):
+    frame = FakeFrame()
+    page = FakePage()
+    decision = Decision(action="nonsense", button_label=None, reason="x")  # type: ignore[arg-type]
+    budget = AdvisorBudget()
+
+    result = apply_advisor_decision(decision, frame, page, budget=budget)
+    assert result == "declined"

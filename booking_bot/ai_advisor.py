@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Literal
 
 from booking_bot import config
+from booking_bot.exceptions import AdvisorSkipRow
 
 log = logging.getLogger("ai_advisor")
 
@@ -646,3 +647,48 @@ def _consult_slow_path(
         f"skips={budget.total_skips}/{budget.max_total_skips}"
     )
     return decision
+
+
+def apply_advisor_decision(
+    decision: Decision,
+    frame,
+    page,
+    *,
+    budget: AdvisorBudget,
+) -> str:
+    """Dispatch on decision.action. Returns 'acted' if the action was
+    executed, 'declined' if the action was not recognised.
+
+    For action='click', delegates to playbook._click_by_action.
+    For action='reload', calls page.reload + page.wait_for_timeout.
+    For action='skip_row', raises AdvisorSkipRow(reason) — the row
+    loop is responsible for catching it and writing the ISSUE row.
+
+    Updates budget counters on successful dispatch: click/reload
+    call record_non_skip_decision, skip_row calls record_skip.
+    """
+    if decision.action == "click":
+        from booking_bot.playbook import Action, _click_by_action
+        _click_by_action(
+            frame,
+            Action(
+                kind="click",
+                button_text=decision.button_label,
+                button_id=None,
+            ),
+        )
+        budget.record_non_skip_decision()
+        return "acted"
+
+    if decision.action == "reload":
+        page.reload(wait_until="domcontentloaded", timeout=60_000)
+        page.wait_for_timeout(config.PAGE_LOAD_WAIT_S * 1000)
+        budget.record_non_skip_decision()
+        return "acted"
+
+    if decision.action == "skip_row":
+        budget.record_skip()
+        raise AdvisorSkipRow(decision.reason)
+
+    log.warning(f"apply_advisor_decision: unknown action {decision.action!r}; declining")
+    return "declined"
