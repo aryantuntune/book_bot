@@ -191,7 +191,7 @@ def _interactive_auth_seed(
     seed.mkdir(parents=True, exist_ok=True)
     pw, _browser_obj, ctx, _page = browser.start_browser(
         headless=False,
-        profile_suffix=f"{source}-auth-seed",
+        profile_suffix=f"{source}-op1-auth-seed",
     )
     print(
         f"[auth_template] Auth seed: log in to HPCL in the browser window. "
