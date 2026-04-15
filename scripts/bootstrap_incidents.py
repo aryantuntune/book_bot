@@ -35,18 +35,21 @@ from booking_bot.ai_advisor import IncidentStore  # noqa: E402
 LOG_TIMESTAMP_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
 )
-DETECT_STATE_RE = re.compile(r"detect_state\s*->\s*(\w+)")
 RESET_STUCK_RE = re.compile(
     r"reset stuck on dead-end dialog \(enabled=(\[.*?\])\); "
     r"clicking '([^']+)'"
 )
-CLICKED_RE = re.compile(r"clicked '([^']+)'")
 
-KNOWN_RECOVERED_STATES = {
-    "MAIN_MENU",
-    "BOOK_FOR_OTHERS_MENU",
-    "READY_FOR_CUSTOMER",
-}
+# Real-log recovery signals. The first match after a reset-stuck line,
+# within RECOVERY_WINDOW and before any subsequent reset-stuck, tells us
+# which state the bot recovered to. Order matters only for the regex scan
+# inside a single line; first-signal-wins across lines.
+RECOVERY_SIGNALS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"playbook: reset done"), "BOOK_FOR_OTHERS_MENU"),
+    (re.compile(r"playbook: at main menu"), "MAIN_MENU"),
+    (re.compile(r"row \d+: success code="), "READY_FOR_CUSTOMER"),
+    (re.compile(r"playbook step \d+/\d+: TYPE \[customer_phone\]"), "READY_FOR_CUSTOMER"),
+]
 
 RECOVERY_WINDOW = timedelta(seconds=30)
 
@@ -103,9 +106,13 @@ def parse_log_file(path: Path) -> list[dict]:
             fwd_ts = _parse_ts(lines[j])
             if fwd_ts is not None and fwd_ts - ts > RECOVERY_WINDOW:
                 break
-            dm = DETECT_STATE_RE.search(lines[j])
-            if dm and dm.group(1) in KNOWN_RECOVERED_STATES:
-                recovered_to = dm.group(1)
+            if RESET_STUCK_RE.search(lines[j]):
+                break
+            for pat, target in RECOVERY_SIGNALS:
+                if pat.search(lines[j]):
+                    recovered_to = target
+                    break
+            if recovered_to is not None:
                 break
         if recovered_to is None:
             continue
