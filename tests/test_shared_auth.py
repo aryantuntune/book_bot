@@ -160,3 +160,48 @@ def test_write_overwrites_previous_snapshot(tmp_root):
     assert payload is not None
     names = [c["name"] for c in payload["cookies"]]
     assert names == ["second"]
+
+
+def test_shared_auth_path_without_slot_env(tmp_root, monkeypatch):
+    """Bare bot mode: env var unset → legacy shared_auth.json."""
+    monkeypatch.delenv("BOOKING_BOT_OPERATOR_SLOT", raising=False)
+    assert browser._shared_auth_path() == tmp_root / "shared_auth.json"
+
+
+def test_shared_auth_path_with_slot_env(tmp_root, monkeypatch):
+    """Orchestrator mode: env var set → per-slot shared_auth-opN.json."""
+    monkeypatch.setenv("BOOKING_BOT_OPERATOR_SLOT", "op2")
+    assert browser._shared_auth_path() == tmp_root / "shared_auth-op2.json"
+
+
+def test_shared_auth_path_invalid_slot_falls_back_to_default(
+    tmp_root, monkeypatch,
+):
+    """Defensive: a malformed slot value (path traversal attempt,
+    whitespace, etc.) falls back to the legacy path rather than writing
+    to an attacker-chosen location."""
+    monkeypatch.setenv("BOOKING_BOT_OPERATOR_SLOT", "../evil")
+    assert browser._shared_auth_path() == tmp_root / "shared_auth.json"
+    monkeypatch.setenv("BOOKING_BOT_OPERATOR_SLOT", "op")
+    assert browser._shared_auth_path() == tmp_root / "shared_auth.json"
+    monkeypatch.setenv("BOOKING_BOT_OPERATOR_SLOT", "op1 ")
+    assert browser._shared_auth_path() == tmp_root / "shared_auth.json"
+
+
+def test_write_then_read_round_trip_with_slot(tmp_root, monkeypatch):
+    """Full write/read cycle with a slot set — proves the per-slot file
+    is actually used end-to-end."""
+    monkeypatch.setenv("BOOKING_BOT_OPERATOR_SLOT", "op3")
+    cookies = [
+        {
+            "name": "sessionid", "value": "xyz",
+            "domain": ".hpchatbot.hpcl.co.in", "path": "/",
+        }
+    ]
+    page = _make_page_with_cookies(cookies)
+    browser.write_shared_auth_state(page)
+    assert (tmp_root / "shared_auth-op3.json").exists()
+    assert not (tmp_root / "shared_auth.json").exists()
+    payload = browser.read_shared_auth_state()
+    assert payload is not None
+    assert payload["cookies"] == cookies

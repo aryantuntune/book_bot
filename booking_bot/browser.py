@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -136,10 +137,18 @@ def last_auth_age_s() -> float | None:
 # which will re-write shared_auth.json on success.
 
 
+_SLOT_RE = re.compile(r"^op[1-9]\d*$")
+
+
 def _shared_auth_path() -> Path:
-    """Disk location of the shared auth JSON. At config.ROOT so suffixed
-    profile dirs and the unsuffixed profile all read/write the same file
-    (the single point of cross-instance sync for this laptop)."""
+    """Disk location of the shared auth JSON. Single file per operator
+    slot when BOOKING_BOT_OPERATOR_SLOT is set (orchestrator-spawned
+    bot); falls back to the legacy unslotted filename for bare-bot
+    mode. Malformed slot values fall back to the legacy path rather
+    than writing to an attacker-chosen location."""
+    slot = os.environ.get(config.OPERATOR_SLOT_ENV, "")
+    if slot and _SLOT_RE.match(slot):
+        return Path(config.ROOT) / f"shared_auth-{slot}.json"
     return Path(config.ROOT) / config.SHARED_AUTH_FILENAME
 
 
