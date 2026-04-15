@@ -1065,6 +1065,24 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
                     # the abort and let the bot keep looping through the
                     # 502 cascade forever.
                     raise
+                except AdvisorSkipRow as skip_e:
+                    # The advisor explicitly judged this row hopeless
+                    # (e.g. payment pending). Lock as ISSUE and advance
+                    # without counting against the consecutive-failure
+                    # circuit breaker — this is an intentional single-
+                    # row drop, not a cascade.
+                    log.warning(
+                        f"row {row_idx} ({phone}): advisor chose skip_row "
+                        f"(reason={skip_e.reason!r}); locking as ISSUE and advancing"
+                    )
+                    store.write_issue(
+                        row_idx, phone,
+                        reason=f"advisor_skipped:{skip_e.reason}",
+                        raw="",
+                    )
+                    current_row_idx = None
+                    current_phone = None
+                    continue
                 except Exception as row_e:
                     # Catch-all so a single row's unexpected failure never
                     # kills the whole batch. Mark the row as a transient
