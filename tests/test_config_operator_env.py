@@ -7,6 +7,25 @@ the config module's import-time behavior — the bot's actual auth path
 is covered by auth.py tests."""
 import importlib
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_config_module(monkeypatch):
+    """Reset booking_bot.config module state around every test in this file.
+
+    These tests mutate BOOKING_BOT_OPERATOR_PHONE and reload config to force
+    the import-time env override to re-run. Without this fixture, the final
+    reload in each test leaves config.OPERATOR_PHONE in whatever state the
+    last test produced, and any downstream test that reads config in the
+    same pytest session sees stale data."""
+    monkeypatch.delenv("BOOKING_BOT_OPERATOR_PHONE", raising=False)
+    from booking_bot import config
+    importlib.reload(config)
+    yield
+    monkeypatch.delenv("BOOKING_BOT_OPERATOR_PHONE", raising=False)
+    importlib.reload(config)
+
 
 def test_operator_phone_env_override(monkeypatch):
     monkeypatch.setenv("BOOKING_BOT_OPERATOR_PHONE", "9876543210")
