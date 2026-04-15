@@ -138,64 +138,95 @@ def clone_to_chunks(source: str, chunks: list[ChunkSpec]) -> None:
         raise exceptions.AuthCloneFailed(failures=failures)
 
 
-def ensure_auth_seed(
-    source: str, *, operator_phone: str | None = None,
-) -> Path:
-    """Return the path to an authenticated auth-seed profile for `source`.
+def ensure_auth_seeds(
+    source: str, operator_phones: list[str],
+) -> dict[str, Path]:
+    """Return {slot: seed_path} for each operator phone in `operator_phones`.
+    Slots are positional: op1, op2, ..., opK.
 
-    Three paths, tried in order:
-      A) Seed already exists and its last_auth is fresher than
-         (AUTH_COOLDOWN_S - ORCHESTRATOR_AUTH_SEED_BUFFER_S). Return it.
-      B) Seed is missing/stale, but the main .chromium-profile has a
-         fresh last_auth.json. Copy main profile to seed path, scrub
-         locks, return.
-      C) Neither above applies. Launch an interactive browser, block
-         until the operator logs in (or timeout), then return.
+    For each slot, tries three paths:
+      A) Seed already exists with fresh last_auth.json. Use as-is.
+      B) Only for op1: main .chromium-profile is fresh → copytree to seed.
+      C) Launch interactive Chromium against the slot's seed dir, block
+         until the operator logs in (or timeout).
+
+    Writes a seed_phone.json alongside each successful seed recording
+    which phone seeded it. Raises AuthSeedTimeout on interactive timeout
+    of any slot — previous slots' seeds are left on disk for a retry to
+    pick up.
     """
-    seed = _seed_path(source)
+    if not operator_phones:
+        raise ValueError("operator_phones must be non-empty")
     max_age_s = float(
         config.AUTH_COOLDOWN_S - config.ORCHESTRATOR_AUTH_SEED_BUFFER_S
     )
+    seeds: dict[str, Path] = {}
+    for i, phone in enumerate(operator_phones):
+        slot = f"op{i + 1}"
+        seed = _seed_path(source, slot)
 
-    # Path A.
-    if seed.exists() and _auth_fresh(seed, max_age_s=max_age_s):
-        log.info(f"auth seed for {source}: fresh ({seed})")
-        return seed
+        if seed.exists() and _auth_fresh(seed, max_age_s=max_age_s):
+            log.info(f"auth seed {source}/{slot}: fresh ({seed})")
+            seeds[slot] = seed
+            _write_seed_phone(source, slot, phone)
+            continue
 
-    # Path B.
-    main_profile = config.ROOT / ".chromium-profile"
-    if main_profile.exists() and _auth_fresh(main_profile, max_age_s=max_age_s):
+        if slot == "op1":
+            main_profile = config.ROOT / ".chromium-profile"
+            if main_profile.exists() and _auth_fresh(
+                main_profile, max_age_s=max_age_s,
+            ):
+                log.info(
+                    f"auth seed {source}/op1: copying from main profile "
+                    f"{main_profile}"
+                )
+                if seed.exists():
+                    shutil.rmtree(seed)
+                shutil.copytree(main_profile, seed)
+                _scrub_lock_files(seed)
+                _write_seed_phone(source, slot, phone)
+                seeds[slot] = seed
+                continue
+
         log.info(
-            f"auth seed for {source}: copying from main profile {main_profile}"
+            f"auth seed {source}/{slot}: launching interactive auth for "
+            f"operator {phone[:3]}XXXXXXX"
         )
-        if seed.exists():
-            shutil.rmtree(seed)
-        shutil.copytree(main_profile, seed)
-        _scrub_lock_files(seed)
-        return seed
+        path = _interactive_auth_seed(source, slot=slot, operator_phone=phone)
+        _write_seed_phone(source, slot, phone)
+        seeds[slot] = path
+    return seeds
 
-    # Path C.
-    log.info(f"auth seed for {source}: launching interactive auth")
-    return _interactive_auth_seed(source, operator_phone=operator_phone)
+
+def ensure_auth_seed(
+    source: str, *, operator_phone: str | None = None,
+) -> Path:
+    """Legacy single-slot wrapper. Callers that don't know about multi-op
+    (existing single-operator code paths) continue to work unchanged."""
+    phone = operator_phone or config.OPERATOR_PHONE
+    seeds = ensure_auth_seeds(source, [phone])
+    return seeds["op1"]
 
 
 def _interactive_auth_seed(
-    source: str, *, operator_phone: str | None = None,
+    source: str, *, slot: str = "op1", operator_phone: str | None = None,
 ) -> Path:
     """Interactive Path C. Launches a real Chromium window against
-    `.chromium-profile-<source>-auth-seed/`, polls the profile's
+    `.chromium-profile-<source>-<slot>-auth-seed/`, polls the profile's
     last_auth.json, and closes the browser once the operator logs in.
     Raises AuthSeedTimeout on timeout."""
     from booking_bot import browser  # lazy — keeps Playwright off the import graph for unit tests
-    seed = _seed_path(source)
+    seed = _seed_path(source, slot)
     seed.mkdir(parents=True, exist_ok=True)
     pw, _browser_obj, ctx, _page = browser.start_browser(
         headless=False,
-        profile_suffix=f"{source}-op1-auth-seed",
+        profile_suffix=f"{source}-{slot}-auth-seed",
     )
     print(
-        f"[auth_template] Auth seed: log in to HPCL in the browser window. "
-        f"This window will close once authentication completes "
+        f"[auth_template] Auth seed {slot}: log in to HPCL in the browser "
+        f"window as operator "
+        f"{(operator_phone or '')[:3]}XXXXXXX. This window will close once "
+        f"authentication completes "
         f"(timeout: {config.ORCHESTRATOR_AUTH_TIMEOUT_S // 60} min).",
         flush=True,
     )
@@ -210,7 +241,7 @@ def _interactive_auth_seed(
                     return seed
             time.sleep(2.0)
         raise exceptions.AuthSeedTimeout(
-            f"auth seed for {source} timed out after "
+            f"auth seed for {source}/{slot} timed out after "
             f"{config.ORCHESTRATOR_AUTH_TIMEOUT_S}s"
         )
     finally:
