@@ -211,3 +211,46 @@ class IncidentStore:
         the exact canonicalization: lowercase, stripped, sorted, joined."""
         labels = sorted((b or "").strip().lower() for b in buttons)
         return f"{state}|{'|'.join(labels)}"
+
+    def lookup_exact(
+        self,
+        state: str,
+        buttons: tuple[str, ...],
+    ) -> dict | None:
+        """Exact-match lookup by (state, sorted canonicalized buttons).
+        Returns the stored incident dict or None. This is the fast path
+        that skips the API call entirely on repeat stucks."""
+        key = self.make_key(state, buttons)
+        return self._by_key.get(key)
+
+    def similar(
+        self,
+        state: str,
+        buttons: tuple[str, ...],
+        top_k: int = 5,
+    ) -> list[dict]:
+        """Return up to top_k incidents from the same state, ranked by
+        Jaccard similarity on the button-label sets. Used as few-shot
+        context for the slow (API) path. Ties broken by timestamp
+        (newer first) then by occurrences (higher first)."""
+        query_set = {(b or "").strip().lower() for b in buttons}
+        candidates = []
+        for rec in self._by_key.values():
+            if rec.get("state") != state:
+                continue
+            rec_buttons = rec.get("buttons_sorted") or []
+            rec_set = {(b or "").strip().lower() for b in rec_buttons}
+            union = query_set | rec_set
+            if not union:
+                jaccard = 0.0
+            else:
+                jaccard = len(query_set & rec_set) / len(union)
+            candidates.append((jaccard, rec))
+        candidates.sort(
+            key=lambda t: (
+                -t[0],
+                -(t[1].get("occurrences") or 0),
+                t[1].get("timestamp") or "",
+            ),
+        )
+        return [rec for (_score, rec) in candidates[:top_k]]

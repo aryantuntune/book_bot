@@ -221,3 +221,114 @@ def test_incident_store_skips_malformed_lines(tmp_path):
     )
     store = IncidentStore(path)
     assert len(store) == 1
+
+
+def test_incident_store_lookup_exact_match(tmp_path):
+    path = tmp_path / "incidents.jsonl"
+    _write_incidents(path, [{
+        "key": IncidentStore.make_key("UNKNOWN", ["Make Payment", "Previous Menu"]),
+        "state": "UNKNOWN",
+        "buttons_sorted": ["Make Payment", "Previous Menu"],
+        "last_bubble_excerpt": "payment pending",
+        "chosen_action": {"action": "click", "button_label": "Previous Menu", "reason": "escape"},
+        "outcome": "recovered",
+        "recovered_to_state": "BOOK_FOR_OTHERS_MENU",
+        "source": "bootstrap",
+        "timestamp": "2026-04-15T14:12:33Z",
+        "occurrences": 1,
+    }])
+    store = IncidentStore(path)
+    hit = store.lookup_exact("UNKNOWN", ("Make Payment", "Previous Menu"))
+    assert hit is not None
+    assert hit["chosen_action"]["button_label"] == "Previous Menu"
+
+
+def test_incident_store_lookup_is_case_insensitive(tmp_path):
+    path = tmp_path / "incidents.jsonl"
+    _write_incidents(path, [{
+        "key": IncidentStore.make_key("UNKNOWN", ["Make Payment", "Previous Menu"]),
+        "state": "UNKNOWN",
+        "buttons_sorted": ["Make Payment", "Previous Menu"],
+        "last_bubble_excerpt": "",
+        "chosen_action": {"action": "click", "button_label": "Previous Menu", "reason": "x"},
+        "outcome": "recovered",
+        "recovered_to_state": "MAIN_MENU",
+        "source": "bootstrap",
+        "timestamp": "2026-04-15T14:12:33Z",
+        "occurrences": 1,
+    }])
+    store = IncidentStore(path)
+    hit = store.lookup_exact("UNKNOWN", ("PREVIOUS MENU", "make payment"))
+    assert hit is not None
+
+
+def test_incident_store_lookup_miss_returns_none(tmp_path):
+    store = IncidentStore(tmp_path / "missing.jsonl")
+    assert store.lookup_exact("UNKNOWN", ("a", "b")) is None
+
+
+def test_incident_store_similar_ranks_by_jaccard(tmp_path):
+    path = tmp_path / "incidents.jsonl"
+    _write_incidents(path, [
+        {
+            "key": IncidentStore.make_key("UNKNOWN", ["a", "b", "c"]),
+            "state": "UNKNOWN",
+            "buttons_sorted": ["a", "b", "c"],
+            "last_bubble_excerpt": "one",
+            "chosen_action": {"action": "reload", "button_label": None, "reason": "one"},
+            "outcome": "recovered", "recovered_to_state": "MAIN_MENU",
+            "source": "bootstrap", "timestamp": "2026-04-15T00:00:00Z", "occurrences": 1,
+        },
+        {
+            "key": IncidentStore.make_key("UNKNOWN", ["a", "b"]),
+            "state": "UNKNOWN",
+            "buttons_sorted": ["a", "b"],
+            "last_bubble_excerpt": "two",
+            "chosen_action": {"action": "click", "button_label": "a", "reason": "two"},
+            "outcome": "recovered", "recovered_to_state": "MAIN_MENU",
+            "source": "bootstrap", "timestamp": "2026-04-15T00:00:00Z", "occurrences": 1,
+        },
+        {
+            "key": IncidentStore.make_key("BOOK_FOR_OTHERS_MENU", ["a", "b"]),
+            "state": "BOOK_FOR_OTHERS_MENU",
+            "buttons_sorted": ["a", "b"],
+            "last_bubble_excerpt": "three",
+            "chosen_action": {"action": "click", "button_label": "a", "reason": "three"},
+            "outcome": "recovered", "recovered_to_state": "MAIN_MENU",
+            "source": "bootstrap", "timestamp": "2026-04-15T00:00:00Z", "occurrences": 1,
+        },
+        {
+            "key": IncidentStore.make_key("UNKNOWN", ["x", "y"]),
+            "state": "UNKNOWN",
+            "buttons_sorted": ["x", "y"],
+            "last_bubble_excerpt": "four",
+            "chosen_action": {"action": "reload", "button_label": None, "reason": "four"},
+            "outcome": "recovered", "recovered_to_state": "MAIN_MENU",
+            "source": "bootstrap", "timestamp": "2026-04-15T00:00:00Z", "occurrences": 1,
+        },
+    ])
+    store = IncidentStore(path)
+    similar = store.similar("UNKNOWN", ("a", "b"), top_k=5)
+    assert len(similar) == 3
+    assert similar[0]["last_bubble_excerpt"] == "two"
+    assert similar[1]["last_bubble_excerpt"] == "one"
+    assert similar[2]["last_bubble_excerpt"] == "four"
+
+
+def test_incident_store_similar_respects_top_k(tmp_path):
+    path = tmp_path / "incidents.jsonl"
+    records = []
+    for i in range(10):
+        records.append({
+            "key": IncidentStore.make_key("UNKNOWN", [f"b{i}"]),
+            "state": "UNKNOWN",
+            "buttons_sorted": [f"b{i}"],
+            "last_bubble_excerpt": f"rec{i}",
+            "chosen_action": {"action": "reload", "button_label": None, "reason": "x"},
+            "outcome": "recovered", "recovered_to_state": "MAIN_MENU",
+            "source": "bootstrap", "timestamp": "2026-04-15T00:00:00Z", "occurrences": 1,
+        })
+    _write_incidents(path, records)
+    store = IncidentStore(path)
+    similar = store.similar("UNKNOWN", ("b0",), top_k=3)
+    assert len(similar) == 3
