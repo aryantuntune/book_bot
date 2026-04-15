@@ -137,7 +137,7 @@ def last_auth_age_s() -> float | None:
 # which will re-write shared_auth.json on success.
 
 
-_SLOT_RE = re.compile(r"^op[1-9]\d*$")
+_SLOT_RE = re.compile(r"^op[1-9]\d*\Z")
 
 
 def _shared_auth_path() -> Path:
@@ -183,7 +183,7 @@ def write_shared_auth_state(page: Page) -> None:
         tmp.write_text(json.dumps(payload))
         os.replace(tmp, path)
         log.info(
-            f"wrote {config.SHARED_AUTH_FILENAME}: {len(hpcl_cookies)} HPCL "
+            f"wrote {path.name}: {len(hpcl_cookies)} HPCL "
             f"cookie(s) available for other parallel instances"
         )
     except Exception as e:

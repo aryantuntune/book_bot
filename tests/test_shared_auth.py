@@ -186,6 +186,8 @@ def test_shared_auth_path_invalid_slot_falls_back_to_default(
     assert browser._shared_auth_path() == tmp_root / "shared_auth.json"
     monkeypatch.setenv("BOOKING_BOT_OPERATOR_SLOT", "op1 ")
     assert browser._shared_auth_path() == tmp_root / "shared_auth.json"
+    monkeypatch.setenv("BOOKING_BOT_OPERATOR_SLOT", "op1\n")
+    assert browser._shared_auth_path() == tmp_root / "shared_auth.json"
 
 
 def test_write_then_read_round_trip_with_slot(tmp_root, monkeypatch):
