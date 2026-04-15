@@ -3,6 +3,7 @@ import pytest
 
 from booking_bot.playbook import (
     Action,
+    _choose_reset_target,
     classify_value,
     events_to_actions,
     split_playbook,
@@ -264,3 +265,104 @@ def test_split_missing_customer_phone_raises():
     ]
     with pytest.raises(ValueError, match="customer_phone"):
         split_playbook(actions)
+
+
+# ---- _choose_reset_target ----
+#
+# Pure decision helper for reset_to_customer_entry. Takes the enabled-button
+# list plus two escape-attempted flags and decides which button path the
+# caller should take to get back to the customer-phone entry state.
+
+def test_reset_target_book_with_other_mobile_wins():
+    assert _choose_reset_target(
+        enabled=["Book With Other Mobile", "Previous Menu"],
+        escape_tried=False,
+        prev_menu_tried=False,
+    ) == "book_with_other_mobile"
+
+
+def test_reset_target_book_for_others_direct():
+    assert _choose_reset_target(
+        enabled=["Book for Others", "Previous Menu"],
+        escape_tried=False,
+        prev_menu_tried=False,
+    ) == "book_for_others"
+
+
+def test_reset_target_booking_services_path():
+    assert _choose_reset_target(
+        enabled=["Booking Services", "Other Services"],
+        escape_tried=False,
+        prev_menu_tried=False,
+    ) == "booking_services"
+
+
+def test_reset_target_main_menu_path():
+    assert _choose_reset_target(
+        enabled=["Main Menu"],
+        escape_tried=False,
+        prev_menu_tried=False,
+    ) == "main_menu"
+
+
+def test_reset_target_no_escape_hatch():
+    # Dangling Yes/No bubble after a 502 during a 'Yes' click.
+    assert _choose_reset_target(
+        enabled=["No"],
+        escape_tried=False,
+        prev_menu_tried=False,
+    ) == "no_escape"
+
+
+def test_reset_target_no_escape_not_retried():
+    assert _choose_reset_target(
+        enabled=["No"],
+        escape_tried=True,
+        prev_menu_tried=False,
+    ) == "none"
+
+
+def test_reset_target_previous_menu_escape_for_payment_pending():
+    # HPCL presents a payment-pending dead-end dialog with only
+    # 'Make Payment' and 'Previous Menu' enabled. Must click
+    # Previous Menu to back out, not raise.
+    assert _choose_reset_target(
+        enabled=["Make Payment", "Previous Menu"],
+        escape_tried=False,
+        prev_menu_tried=False,
+    ) == "previous_menu_escape"
+
+
+def test_reset_target_previous_menu_escape_not_retried():
+    assert _choose_reset_target(
+        enabled=["Make Payment", "Previous Menu"],
+        escape_tried=False,
+        prev_menu_tried=True,
+    ) == "none"
+
+
+def test_reset_target_nav_buttons_beat_previous_menu():
+    # If both a nav button and 'Previous Menu' are enabled, the nav
+    # button takes precedence — Previous Menu is the last-resort escape.
+    assert _choose_reset_target(
+        enabled=["Book for Others", "Previous Menu"],
+        escape_tried=False,
+        prev_menu_tried=False,
+    ) == "book_for_others"
+
+
+def test_reset_target_empty_returns_none():
+    assert _choose_reset_target(
+        enabled=[],
+        escape_tried=False,
+        prev_menu_tried=False,
+    ) == "none"
+
+
+def test_reset_target_case_insensitive():
+    # Button labels from the DOM may arrive in any case.
+    assert _choose_reset_target(
+        enabled=["MAKE PAYMENT", "previous menu"],
+        escape_tried=False,
+        prev_menu_tried=False,
+    ) == "previous_menu_escape"

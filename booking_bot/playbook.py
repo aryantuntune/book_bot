@@ -446,8 +446,59 @@ def replay_auth(
     log.info("playbook auth: done")
 
 
+def _choose_reset_target(
+    enabled: list[str],
+    escape_tried: bool,
+    prev_menu_tried: bool,
+) -> str:
+    """Pure decision helper for reset_to_customer_entry. Given the list of
+    enabled button labels and the two escape-attempted flags, return the
+    name of the path the caller should take. One of:
+
+        'book_with_other_mobile' — alt-menu dead-end, click the one button
+            that exits it.
+        'book_for_others'        — already in the sub-menu, click direct.
+        'booking_services'       — at main menu, click Booking Services then
+            Book for Others.
+        'main_menu'              — at some other sub-menu, click Main Menu
+            then replay auth_prefix.
+        'no_escape'              — dangling Yes/No bubble from a 502 during
+            'Yes' click; dismiss with 'No' and retry reset.
+        'previous_menu_escape'   — payment-pending / dead-end dialog whose
+            only enabled buttons are terminal actions + 'Previous Menu'.
+            Click 'Previous Menu' to back out and retry reset.
+        'none'                   — no path available; caller should raise.
+
+    Priority matters: nav buttons always beat escape hatches, and each
+    escape hatch is gated by its own 'tried' flag so we can never loop.
+    The 'Previous Menu' escape is the LAST resort — an earlier priority
+    would have matched if the current dialog were a real menu we can
+    navigate forward from."""
+    lower = [(b or "").lower() for b in enabled]
+
+    def _has(needle: str) -> bool:
+        return any(needle in b for b in lower)
+
+    if _has("book with other mobile"):
+        return "book_with_other_mobile"
+    if _has("book for others"):
+        return "book_for_others"
+    if _has("booking services"):
+        return "booking_services"
+    if _has("main menu"):
+        return "main_menu"
+    if not escape_tried and _has("no"):
+        return "no_escape"
+    if not prev_menu_tried and _has("previous menu"):
+        return "previous_menu_escape"
+    return "none"
+
+
 def reset_to_customer_entry(
-    frame: Frame, playbook: Playbook, _escape_tried: bool = False,
+    frame: Frame,
+    playbook: Playbook,
+    _escape_tried: bool = False,
+    _prev_menu_tried: bool = False,
 ) -> None:
     """Navigate the chat from ANY state back to 'enter customer phone' with
     the MINIMUM number of clicks. Previous incarnations blindly clicked Main
@@ -469,17 +520,20 @@ def reset_to_customer_entry(
          Others (we're on the main menu).
       4. Main Menu enabled → click it, wait, replay full auth_prefix.
 
-    ESCAPE HATCH: if NONE of the nav buttons above are visible but 'No' is
-    enabled, we're stuck on a dangling Yes/No confirmation bubble — this
-    happens after a 502 during a 'Yes' click, where HPCL disables the Yes
-    we already clicked and leaves only No. Click No to dismiss the
-    confirmation (HPCL then redraws the parent menu with the nav buttons
-    enabled) and retry reset once. Without this, the stuck state forced a
-    full page reload, which destroyed the chat session and dragged the bot
-    through the OTP-flood loop.
+    ESCAPE HATCHES (tried only as last resort, one attempt each):
+      - 'No' — dangling Yes/No confirmation bubble (a 502 during a 'Yes'
+        click left HPCL with only the 'No' button enabled). Dismiss with
+        'No' and HPCL redraws the parent menu with nav buttons enabled.
+      - 'Previous Menu' — payment-pending / dead-end dialogs that show
+        only a terminal action (e.g. 'Make Payment') plus 'Previous Menu'.
+        Back out with 'Previous Menu' and HPCL redraws the parent menu.
 
-    Only Raises IframeLostError / OptionNotFoundError if NONE of the above
-    paths work — in which case the caller falls back to full recovery."""
+    Without these, stuck states forced full page reloads that destroyed
+    the chat session and dragged the bot through the OTP-flood loop.
+
+    Only raises IframeLostError / OptionNotFoundError if NONE of the
+    above paths work — in which case the caller falls back to full
+    recovery."""
     try:
         state = chat.detect_state(frame)
     except IframeLostError:
@@ -490,12 +544,13 @@ def reset_to_customer_entry(
 
     snap = _read_state_snapshot(frame)
     enabled = snap.get("enabled") or []
-    lower = [(b or "").lower() for b in enabled]
+    target = _choose_reset_target(
+        enabled=enabled,
+        escape_tried=_escape_tried,
+        prev_menu_tried=_prev_menu_tried,
+    )
 
-    def _has(needle: str) -> bool:
-        return any(needle in b for b in lower)
-
-    if _has("book with other mobile"):
+    if target == "book_with_other_mobile":
         log.info("playbook: alt menu detected; clicking 'Book With Other Mobile'")
         _click_by_action(
             frame,
@@ -505,7 +560,7 @@ def reset_to_customer_entry(
         log.info("playbook: reset done (alt menu)")
         return
 
-    if _has("book for others"):
+    if target == "book_for_others":
         log.info("playbook: 'Book for Others' already enabled; clicking direct")
         _click_by_action(
             frame,
@@ -515,7 +570,7 @@ def reset_to_customer_entry(
         log.info("playbook: reset done (direct Book for Others)")
         return
 
-    if _has("booking services"):
+    if target == "booking_services":
         log.info("playbook: at main menu; clicking Booking Services → Book for Others")
         _click_by_action(
             frame,
@@ -530,7 +585,7 @@ def reset_to_customer_entry(
         log.info("playbook: reset done (Booking Services → Book for Others)")
         return
 
-    if _has("main menu"):
+    if target == "main_menu":
         log.info("playbook: resetting via Main Menu → auth_prefix")
         _click_by_action(
             frame,
@@ -561,12 +616,7 @@ def reset_to_customer_entry(
         log.info("playbook: reset done (Main Menu path)")
         return
 
-    # Dangling-confirmation escape hatch. If none of the nav buttons above
-    # matched but 'No' is enabled, we're on a stuck Yes/No bubble (a 502
-    # ate the 'Yes' click and left only 'No'). Dismissing with 'No' returns
-    # to the prior menu, which usually has the nav buttons. Guarded by
-    # _escape_tried so we can't loop forever if 'No' itself leads nowhere.
-    if not _escape_tried and _has("no"):
+    if target == "no_escape":
         log.warning(
             f"playbook: reset stuck on dangling confirmation "
             f"(enabled={enabled!r}); clicking 'No' to dismiss and retrying reset"
@@ -580,7 +630,33 @@ def reset_to_customer_entry(
             log.warning("playbook: 'No' click failed; falling through to raise")
         else:
             chat.wait_until_settled(frame)
-            reset_to_customer_entry(frame, playbook, _escape_tried=True)
+            reset_to_customer_entry(
+                frame, playbook,
+                _escape_tried=True, _prev_menu_tried=_prev_menu_tried,
+            )
+            return
+
+    if target == "previous_menu_escape":
+        log.warning(
+            f"playbook: reset stuck on dead-end dialog "
+            f"(enabled={enabled!r}); clicking 'Previous Menu' to back out "
+            f"and retrying reset"
+        )
+        try:
+            _click_by_action(
+                frame,
+                Action(kind="click", button_text="Previous Menu", button_id=None),
+            )
+        except OptionNotFoundError:
+            log.warning(
+                "playbook: 'Previous Menu' click failed; falling through to raise"
+            )
+        else:
+            chat.wait_until_settled(frame)
+            reset_to_customer_entry(
+                frame, playbook,
+                _escape_tried=_escape_tried, _prev_menu_tried=True,
+            )
             return
 
     raise OptionNotFoundError(

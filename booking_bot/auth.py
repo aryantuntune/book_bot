@@ -12,6 +12,7 @@ from playwright.sync_api import Frame
 from booking_bot import chat, config
 from booking_bot.exceptions import (
     AuthFailedError,
+    IframeLostError,
     OptionNotFoundError,
 )
 
@@ -27,14 +28,28 @@ def _wait_for_known_state(frame: Frame, total_timeout_s: float = 20.0) -> str:
     This polls detect_state directly (a single fast JS evaluate) rather
     than calling wait_until_settled, because settling has its own 60s
     timeout that would dominate here when the scroller is already quiet.
-    Short polls also let Ctrl-C break out within ~500ms."""
+    Short polls also let Ctrl-C break out within ~500ms.
+
+    Transient IframeLostError during polling (HPCL sometimes navigates
+    mid-eval on the first load — e.g. a stale profile cookie triggering
+    a redirect) is swallowed as UNKNOWN so the next poll can re-try
+    against the fresh execution context. Without this swallow, a single
+    mid-poll navigation would propagate up as UNHANDLED and kill the run
+    before we ever check whether the session was still alive."""
     import time
     deadline = time.monotonic() + total_timeout_s
     state = "UNKNOWN"
     attempt = 0
     while time.monotonic() < deadline:
         attempt += 1
-        state = chat.detect_state(frame)
+        try:
+            state = chat.detect_state(frame)
+        except IframeLostError as e:
+            log.warning(
+                f"_wait_for_known_state: transient IframeLostError on poll "
+                f"{attempt} ({e}); treating as UNKNOWN and retrying"
+            )
+            state = "UNKNOWN"
         if state != "UNKNOWN":
             log.info(f"state resolved after {attempt} polls: {state!r}")
             return state
