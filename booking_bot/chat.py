@@ -371,6 +371,39 @@ def _classify_state(button_labels: list[str], scroller_text: str) -> str:
     return "UNKNOWN"
 
 
+def _resolve_state(
+    enabled_buttons: list[str],
+    last_bubble_text: str,
+    recent_text: str,
+    has_empty_input: bool,
+) -> str:
+    """Pure priority pipeline used by detect_state. Kept separate from the
+    Frame-reading wrapper so we can unit-test the resolution rules with
+    canned DOM data.
+
+    Priority order (see detect_state docstring for the WHY):
+      1. Enabled menu buttons that match a state pattern.
+      2. Auth/OTP text in the LAST BUBBLE ONLY — never in scrollback,
+         because stale auth bubbles from a prior cycle would otherwise
+         re-trigger NEEDS_OPERATOR_AUTH after a healthy login.
+      3. Empty inline input → READY_FOR_CUSTOMER.
+      4. Last-resort recent-text classifier."""
+    if enabled_buttons:
+        button_state = _classify_state(enabled_buttons, "")
+        if button_state != "UNKNOWN":
+            return button_state
+
+    for state_name in ("NEEDS_OPERATOR_AUTH", "NEEDS_OPERATOR_OTP"):
+        for p in config.STATE_PATTERNS[state_name]:
+            if p.search(last_bubble_text or ""):
+                return state_name
+
+    if has_empty_input:
+        return "READY_FOR_CUSTOMER"
+
+    return _classify_state([], recent_text)
+
+
 def detect_state(frame: Frame) -> str:
     """Read interactive DOM state and classify with a strict priority order:
 
@@ -380,22 +413,21 @@ def detect_state(frame: Frame) -> str:
          buttons is what stops a stale "Book for Others" bubble from
          re-classifying us as BOOK_FOR_OTHERS_MENU after we've moved on.
 
-      2. Explicit auth/OTP patterns from the LATEST chat bubbles — these
+      2. Explicit auth/OTP patterns from the SINGLE LAST bubble — these
          strings are unique to HPCL's auth gate and never appear in normal
          booking flow, so checking them here is safe before the input-
          presence heuristic (which would otherwise misread an auth input
          as the customer-phone prompt).
 
-         CRITICAL: we scan ONLY the last few bubble children of #scroller,
-         not `innerText.slice(-1000)`. The slice approach was the cause of
-         the OTP-flood loop: on a manual restart the persistent chrome
-         profile reopens the chat to a post-auth state (customer-phone
-         prompt), but the scrollback still contains the "OTP sent to..."
-         bubble from the prior auth cycle — which lives inside the last
-         1000 chars and false-positive matches `otp.*sent`. The bot then
-         prompts the operator for an OTP, types it into the customer-phone
-         input, HPCL rejects it, and the bot loops forever on the
-         "OTP crashing page".
+         CRITICAL: we scan ONLY the LAST non-empty bubble of #scroller,
+         not the last 5 and not `innerText.slice(-1000)`. Earlier
+         iterations scanned the last 5 bubbles, but after a successful
+         OTP the auth-prompt bubble was still inside that window —
+         detect_state then returned NEEDS_OPERATOR_AUTH on the customer-
+         phone prompt and the bot looped trying to navigate back to a
+         menu that was already past. Auth/OTP prompts are always single-
+         bubble events in HPCL, so the last-bubble-only check is both
+         tighter and complete (fixed 2026-04-15).
 
       3. An EMPTY inline <input> that isn't the replybox — when buttons
          and auth-text don't match, an empty form field means HPCL is
@@ -437,18 +469,26 @@ def detect_state(frame: Frame) -> str:
                 return true;
               }});
               const s = document.querySelector('{config.SEL_SCROLLER}');
-              // Text of the LAST few bubble children — the "current prompt"
-              // as the operator sees it. Classifying off innerText.slice(-1000)
-              // is unsafe because stale 'OTP sent to...' bubbles live inside
-              // that tail and false-positive the auth classifier on a healthy
-              // session (the OTP-flood loop, fixed 2026-04-14).
+              // Build TWO views of the recent scroller text:
+              //  - lastBubbleText: ONLY the very last non-empty bubble. Used
+              //    for the strict auth/OTP detection, which must NOT see
+              //    stale auth bubbles still sitting in scrollback after a
+              //    successful login (the false-positive that caused the
+              //    post-OTP "stuck on main menu" loop, fixed 2026-04-15).
+              //  - recentText: last 5 non-empty bubbles joined. Used as the
+              //    weak fallback classifier when nothing more specific
+              //    matches.
               let recentText = '';
+              let lastBubbleText = '';
               if (s) {{
                 const kids = Array.from(s.children);
                 const recent = [];
                 for (let i = kids.length - 1; i >= 0 && recent.length < 5; i--) {{
                   const t = (kids[i].innerText || '').trim();
-                  if (t) recent.unshift(t);
+                  if (t) {{
+                    if (lastBubbleText === '') lastBubbleText = t;
+                    recent.unshift(t);
+                  }}
                 }}
                 recentText = recent.join('\\n');
                 // Fallback for flat scroller layouts (no per-message children):
@@ -456,11 +496,13 @@ def detect_state(frame: Frame) -> str:
                 // it rarely spans more than one recent bubble.
                 if (!recentText) {{
                   recentText = (s.innerText || '').slice(-400);
+                  if (!lastBubbleText) lastBubbleText = recentText;
                 }}
               }}
               return {{
                 buttons: btns,
                 text: recentText,
+                lastBubbleText: lastBubbleText,
                 hasEmptyInput: inputs.length > 0,
               }};
             }}
@@ -469,28 +511,12 @@ def detect_state(frame: Frame) -> str:
     except Exception as e:
         raise IframeLostError(f"detect_state: {e}") from e
 
-    buttons = data["buttons"]
-    text = data["text"]
-    has_empty_input = bool(data.get("hasEmptyInput"))
-
-    # Priority 1: enabled menu buttons.
-    if buttons:
-        button_state = _classify_state(buttons, "")
-        if button_state != "UNKNOWN":
-            return button_state
-
-    # Priority 2: explicit auth/OTP patterns from the LATEST bubbles only.
-    for state_name in ("NEEDS_OPERATOR_AUTH", "NEEDS_OPERATOR_OTP"):
-        for p in config.STATE_PATTERNS[state_name]:
-            if p.search(text or ""):
-                return state_name
-
-    # Priority 3: empty inline input → customer-phone prompt.
-    if has_empty_input:
-        return "READY_FOR_CUSTOMER"
-
-    # Priority 4: weakest fallback — recent bubble text only.
-    return _classify_state([], text)
+    return _resolve_state(
+        enabled_buttons=data["buttons"],
+        last_bubble_text=data.get("lastBubbleText") or "",
+        recent_text=data["text"],
+        has_empty_input=bool(data.get("hasEmptyInput")),
+    )
 
 
 # ---- Task 16: dump_visible_state ----

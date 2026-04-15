@@ -636,9 +636,7 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
             for auth_attempt in (1, 2, 3):
                 try:
                     if auth_attempt == 1:
-                        playbook_mod.replay_auth(
-                            frame, pb, config.OPERATOR_PHONE, _prompt_otp,
-                        )
+                        playbook_mod.replay_auth(frame, pb)
                     else:
                         frame = _recover_with_playbook(
                             page, pb, config.OPERATOR_PHONE, _prompt_otp,
@@ -1113,7 +1111,7 @@ def _recover_with_playbook(page, pb, operator_phone, get_otp):
             f"reset after reload failed ({type(e).__name__}: {e}); "
             f"falling back to replay_auth"
         )
-        playbook_mod.replay_auth(frame, pb, operator_phone, get_otp)
+        playbook_mod.replay_auth(frame, pb)
     return frame
 
 

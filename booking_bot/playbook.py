@@ -397,8 +397,6 @@ def replay_actions(frame: Frame, actions: list[Action], context: dict) -> str:
 def replay_auth(
     frame: Frame,
     playbook: Playbook,
-    operator_phone: str,
-    get_otp: Callable[[], str],
 ) -> None:
     """Run the auth_prefix once at bot startup.
 
@@ -413,12 +411,18 @@ def replay_auth(
 
     Fix: before running auth_prefix, inspect enabled buttons. If the first
     auth_prefix target isn't there but Main Menu is, click Main Menu first
-    to transition from the welcome bubble into the main menu state."""
+    to transition from the welcome bubble.
+
+    POST-WELCOME-STATE NAVIGATION: clicking 'Main Menu' from the welcome
+    bubble does NOT always land on the actual main menu — HPCL sometimes
+    jumps the operator straight back into the BOOK_FOR_OTHERS sub-menu
+    (the operator's last-used context, persisted in the HPCL session).
+    A blind replay_actions(auth_prefix) then tries to click the now-
+    disabled 'Booking Services' button and fails. Use the adaptive
+    reset_to_customer_entry instead, which inspects enabled buttons and
+    picks the shortest path to READY_FOR_CUSTOMER from whatever state
+    we actually landed on (fixed 2026-04-15)."""
     log.info(f"playbook auth: {len(playbook.auth_prefix)} steps")
-    context = {
-        "operator_phone": operator_phone,
-        "get_otp": get_otp,
-    }
 
     first_target = (playbook.auth_prefix[0].button_text or "").strip().lower() \
         if playbook.auth_prefix else ""
@@ -438,7 +442,7 @@ def replay_auth(
             )
             chat.wait_until_settled(frame)
 
-    replay_actions(frame, playbook.auth_prefix, context)
+    reset_to_customer_entry(frame, playbook)
     log.info("playbook auth: done")
 
 
