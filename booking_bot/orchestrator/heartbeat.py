@@ -4,7 +4,7 @@ tolerant of missing/corrupt files so the monitor's per-tick scan never
 crashes on a briefly half-written file."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass
 from typing import Literal
 
 Phase = Literal[
@@ -32,6 +32,7 @@ class Heartbeat:
     command: list[str]
     exit_code: int | None
     last_error: str | None
+    operator_slot: str | None = None
 
 
 def mask_phone(phone: str) -> str:
@@ -52,7 +53,8 @@ from pathlib import Path
 
 log = logging.getLogger("orchestrator.heartbeat")
 
-_REQUIRED_FIELDS = {f.name for f in fields(Heartbeat)}
+_REQUIRED_FIELDS = {f.name for f in fields(Heartbeat) if f.default is MISSING and f.default_factory is MISSING}  # type: ignore[misc]
+_ALL_FIELDS = {f.name for f in fields(Heartbeat)}
 
 
 def write(path: Path, hb: Heartbeat) -> None:
@@ -102,7 +104,9 @@ def read(path: Path) -> Heartbeat | None:
     if not _REQUIRED_FIELDS.issubset(data.keys()):
         return None
     try:
-        return Heartbeat(**{name: data[name] for name in _REQUIRED_FIELDS})
+        return Heartbeat(**{
+            name: data[name] for name in _ALL_FIELDS if name in data
+        })
     except (TypeError, ValueError):
         return None
 

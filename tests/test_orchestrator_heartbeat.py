@@ -152,3 +152,43 @@ def test_read_all_ignores_non_heartbeat_files(tmp_path):
     (tmp_path / "ASU" / ".start.lock").write_text("{}")
     (tmp_path / "ASU" / "notes.txt").write_text("hello")
     assert heartbeat.read_all(tmp_path) == []
+
+
+def test_heartbeat_round_trip_with_operator_slot(tmp_path):
+    from booking_bot.orchestrator.heartbeat import Heartbeat, read, write
+    hb = Heartbeat(
+        source="S", chunk_id="S-001", pid=1234,
+        input_file="in.xlsx", profile_suffix="S-001",
+        phase="booking", rows_total=10, rows_done=5, rows_issue=0,
+        rows_pending=5, current_row_idx=6, current_phone="9876543210",
+        started_at="2026-04-16T00:00:00+00:00",
+        last_activity_at="2026-04-16T00:01:00+00:00",
+        command=["python"], exit_code=None, last_error=None,
+        operator_slot="op2",
+    )
+    path = tmp_path / "hb.json"
+    write(path, hb)
+    got = read(path)
+    assert got is not None
+    assert got.operator_slot == "op2"
+
+
+def test_heartbeat_read_old_file_without_operator_slot(tmp_path):
+    """Back-compat: old heartbeat files on disk that lack the new field
+    must still parse successfully (operator_slot defaults to None)."""
+    import json
+    path = tmp_path / "hb.json"
+    path.write_text(json.dumps({
+        "source": "S", "chunk_id": "S-001", "pid": 1234,
+        "input_file": "in.xlsx", "profile_suffix": "S-001",
+        "phase": "booking", "rows_total": 10, "rows_done": 5,
+        "rows_issue": 0, "rows_pending": 5, "current_row_idx": 6,
+        "current_phone": "9876543210",
+        "started_at": "2026-04-16T00:00:00+00:00",
+        "last_activity_at": "2026-04-16T00:01:00+00:00",
+        "command": ["python"], "exit_code": None, "last_error": None,
+    }), encoding="utf-8")
+    from booking_bot.orchestrator.heartbeat import read
+    got = read(path)
+    assert got is not None
+    assert got.operator_slot is None
