@@ -50,3 +50,21 @@ class ProfileInUseError(FatalError):
     by another live booking_bot instance (Chromium enforces single-writer on
     its profile). Surfaced as a loud, actionable error instead of the cryptic
     Playwright TargetClosedError that otherwise trips the auto-restart loop."""
+
+
+class AuthSeedTimeout(BookingBotError):
+    """orchestrator/auth_template.py: interactive auth seed poll loop hit
+    ORCHESTRATOR_AUTH_TIMEOUT_S without seeing a fresh last_auth.json.
+    Caller aborts `orchestrator start` with a clear operator message."""
+
+
+class AuthCloneFailed(BookingBotError):
+    """orchestrator/auth_template.py: one or more `shutil.copytree` calls
+    raised while cloning the auth-seed profile to a chunk profile dir
+    (disk full, permission denied, antivirus lock). Carries a list of
+    (chunk_id, error_str) tuples so the CLI can print every failure."""
+
+    def __init__(self, failures: list[tuple[str, str]]) -> None:
+        self.failures = failures
+        summary = ", ".join(f"{cid}: {err}" for cid, err in failures)
+        super().__init__(f"profile clone failed for {len(failures)} chunks: {summary}")

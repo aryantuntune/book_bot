@@ -24,6 +24,17 @@ OUTPUT_DIR = ROOT / "Output"
 ISSUES_DIR = ROOT / "Issues"
 LOGS_DIR   = ROOT / "logs"
 
+# ---- Multi-instance orchestrator (see docs/superpowers/specs/2026-04-15-multi-instance-orchestrator-design.md) ----
+RUNS_DIR                        = ROOT / "data" / "runs"
+CHUNKS_DIR                      = ROOT / "Input" / "chunks"
+ORCHESTRATOR_LOGS_DIR           = ROOT / "logs" / "orchestrator"
+ORCHESTRATOR_AUTH_SEED_BUFFER_S = 7200    # 2h buffer before AUTH_COOLDOWN_S
+ORCHESTRATOR_STALL_THRESHOLD_S  = 600     # 10 min -> auto-restart eligible
+ORCHESTRATOR_IDLE_WARNING_S     = 120     # 2 min  -> warning in table
+ORCHESTRATOR_MAX_AUTO_RESTARTS  = 3       # per chunk per monitor session
+ORCHESTRATOR_KILL_TIMEOUT_S     = 10.0    # SIGTERM -> SIGKILL fallback
+ORCHESTRATOR_AUTH_TIMEOUT_S     = 900     # 15 min interactive auth wait
+
 # ---- Target ----
 # Direct chatbot URL. Navigating to https://myhpgas.in and clicking the
 # launcher leads here via two nested iframes; going direct gives us the same
