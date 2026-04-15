@@ -232,3 +232,147 @@ class RestartBudget:
 
     def reset(self, chunk_id: str) -> None:
         self._counts.pop(chunk_id, None)
+
+
+import queue
+import threading
+import time
+from pathlib import Path
+
+from rich.console import Console
+from rich.live import Live
+
+from booking_bot import config
+from booking_bot.orchestrator import heartbeat as _heartbeat
+
+
+def render_once(*, runs_dir: Path, source_filter: str | None) -> str:
+    """Read current heartbeats and return the rendered table as a string.
+    Used by tests and by the one-shot `orchestrator status` command."""
+    hbs = _heartbeat.read_all(runs_dir, source=source_filter)
+    console = Console(record=True, width=160)
+    console.print(build_table(hbs))
+    console.print(build_totals_line(hbs))
+    return console.export_text()
+
+
+def _input_thread_fn(cmd_queue: "queue.Queue[str]", stop_evt: threading.Event) -> None:
+    import sys as _sys
+    while not stop_evt.is_set():
+        try:
+            line = _sys.stdin.readline()
+        except Exception:
+            return
+        if not line:
+            return
+        cmd_queue.put(line.rstrip("\r\n"))
+
+
+def run_monitor(
+    source_filter: str | None = None,
+    *,
+    runs_dir: Path | None = None,
+    refresh_hz: float = 1.0,
+) -> int:
+    """Interactive rich.Live loop. Reads heartbeats every tick, renders
+    the table, consumes stdin commands, dispatches to handlers. Returns
+    an integer exit code (0 on clean detach, non-zero on error)."""
+    runs = runs_dir or config.RUNS_DIR
+    budget = RestartBudget(max_per_chunk=config.ORCHESTRATOR_MAX_AUTO_RESTARTS)
+    cmd_queue: "queue.Queue[str]" = queue.Queue()
+    stop_evt = threading.Event()
+
+    input_thread = threading.Thread(
+        target=_input_thread_fn, args=(cmd_queue, stop_evt), daemon=True,
+    )
+    input_thread.start()
+
+    console = Console()
+    try:
+        with Live(build_table([]), console=console,
+                  refresh_per_second=refresh_hz, screen=False) as live:
+            while not stop_evt.is_set():
+                hbs = _heartbeat.read_all(runs, source=source_filter)
+                live.update(build_table(hbs))
+                _handle_stall_detection(hbs, budget, runs)
+                _drain_commands(cmd_queue, stop_evt, runs, source_filter)
+                time.sleep(1.0 / max(refresh_hz, 0.5))
+    finally:
+        stop_evt.set()
+    return 0
+
+
+def _handle_stall_detection(
+    hbs: list[Heartbeat], budget: RestartBudget, runs_dir: Path,
+) -> None:
+    """For each stalled heartbeat, consume the auto-restart budget. If
+    budget is exhausted, mark the heartbeat as failed with a clear
+    last_error so the operator can see it."""
+    for hb in hbs:
+        if not is_stalled(hb, threshold_s=config.ORCHESTRATOR_STALL_THRESHOLD_S):
+            continue
+        if not budget.consume(hb.chunk_id):
+            log.warning(
+                f"chunk {hb.chunk_id}: auto-restart budget exhausted; "
+                f"marking as failed"
+            )
+            hb.phase = "failed"
+            hb.last_error = "auto-restart budget exhausted"
+            hb_path = runs_dir / hb.source / f"{hb.chunk_id}.heartbeat.json"
+            _heartbeat.write(hb_path, hb)
+
+
+def _drain_commands(
+    cmd_queue: "queue.Queue[str]",
+    stop_evt: threading.Event,
+    runs_dir: Path,
+    source_filter: str | None,
+) -> None:
+    while True:
+        try:
+            line = cmd_queue.get_nowait()
+        except queue.Empty:
+            return
+        action, args = parse_command(line)
+        if action == "detach":
+            stop_evt.set()
+            return
+        if action == "stop_all":
+            hbs = _heartbeat.read_all(runs_dir, source=source_filter)
+            for hb in hbs:
+                if hb.exit_code is None and hb.pid > 0:
+                    _kill_pid(hb.pid)
+            stop_evt.set()
+            return
+        if action == "error":
+            log.error(f"command error: {args.get('message')}")
+            continue
+        if action == "help":
+            print(_HELP_TEXT)
+            continue
+        # restart / kill / stop / start are dispatched by orchestrator.cli
+        # at a higher level (they need to import splitter + spawner and
+        # maintain handles). For the MVP monitor run loop, we log them as
+        # "not yet wired" and let the operator use `orchestrator <cmd>`
+        # in a second terminal.
+        log.info(f"command received: action={action} args={args}")
+
+
+def _kill_pid(pid: int) -> None:
+    import os
+    import signal
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as e:
+        log.warning(f"kill pid={pid} failed: {e}")
+
+
+_HELP_TEXT = """\
+Commands:
+  r <chunk-id>    restart a chunk
+  k <chunk-id>    kill a chunk
+  stop <source>   stop all chunks of a source
+  q               detach (chunks keep running)
+  qq              stop all visible chunks and exit
+  h / help / ?    this message
+"""

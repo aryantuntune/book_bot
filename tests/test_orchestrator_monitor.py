@@ -165,3 +165,34 @@ def test_restart_budget_is_per_chunk():
     assert budget.consume("TEST-001") is True
     assert budget.consume("TEST-002") is True  # different chunk — own budget
     assert budget.consume("TEST-001") is False
+
+
+def test_run_monitor_once_renders_current_heartbeats(tmp_path):
+    from booking_bot.orchestrator import heartbeat as hb_mod
+    (tmp_path / "TEST").mkdir()
+    hb_mod.write(
+        tmp_path / "TEST" / "TEST-001.heartbeat.json",
+        _hb("TEST-001", rows_done=7),
+    )
+    hb_mod.write(
+        tmp_path / "TEST" / "TEST-002.heartbeat.json",
+        _hb("TEST-002", rows_done=12, phase="completed"),
+    )
+    text = monitor.render_once(runs_dir=tmp_path, source_filter=None)
+    assert "TEST-001" in text
+    assert "TEST-002" in text
+    assert "7" in text
+    assert "12" in text
+
+
+def test_run_monitor_once_filter_excludes_other_sources(tmp_path):
+    from booking_bot.orchestrator import heartbeat as hb_mod
+    (tmp_path / "ASU").mkdir()
+    (tmp_path / "BPCL").mkdir()
+    hb_mod.write(tmp_path / "ASU" / "ASU-001.heartbeat.json",
+                 _hb("ASU-001", source="ASU"))
+    hb_mod.write(tmp_path / "BPCL" / "BPCL-001.heartbeat.json",
+                 _hb("BPCL-001", source="BPCL"))
+    text = monitor.render_once(runs_dir=tmp_path, source_filter="ASU")
+    assert "ASU-001" in text
+    assert "BPCL-001" not in text
