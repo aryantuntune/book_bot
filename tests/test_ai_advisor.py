@@ -162,3 +162,62 @@ def test_validate_empty_reason_fails():
     snap = _snap(["A"])
     d = Decision(action="reload", button_label=None, reason="")
     assert validate_decision(d, snap) is False
+
+
+import json
+from pathlib import Path
+
+from booking_bot.ai_advisor import IncidentStore
+
+
+def _write_incidents(path: Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+
+
+def test_incident_store_load_missing_file_is_empty(tmp_path):
+    store = IncidentStore(tmp_path / "nope.jsonl")
+    assert len(store) == 0
+
+
+def test_incident_store_load_empty_file_is_empty(tmp_path):
+    path = tmp_path / "incidents.jsonl"
+    path.write_text("")
+    store = IncidentStore(path)
+    assert len(store) == 0
+
+
+def test_incident_store_loads_single_record(tmp_path):
+    path = tmp_path / "incidents.jsonl"
+    _write_incidents(path, [{
+        "key": "UNKNOWN|make payment|previous menu",
+        "state": "UNKNOWN",
+        "buttons_sorted": ["Make Payment", "Previous Menu"],
+        "last_bubble_excerpt": "payment pending",
+        "chosen_action": {"action": "click", "button_label": "Previous Menu", "reason": "escape"},
+        "outcome": "recovered",
+        "recovered_to_state": "BOOK_FOR_OTHERS_MENU",
+        "source": "bootstrap",
+        "timestamp": "2026-04-15T14:12:33Z",
+        "occurrences": 1,
+    }])
+    store = IncidentStore(path)
+    assert len(store) == 1
+
+
+def test_incident_store_skips_malformed_lines(tmp_path):
+    path = tmp_path / "incidents.jsonl"
+    path.write_text(
+        '{"key": "A", "state": "UNKNOWN", "buttons_sorted": ["x"], '
+        '"last_bubble_excerpt": "", '
+        '"chosen_action": {"action": "reload", "button_label": null, "reason": "r"}, '
+        '"outcome": "recovered", "recovered_to_state": "MAIN_MENU", '
+        '"source": "bootstrap", "timestamp": "2026-04-15T00:00:00Z", "occurrences": 1}\n'
+        "\n"
+        "not json at all\n"
+        '{"broken": json}\n'
+    )
+    store = IncidentStore(path)
+    assert len(store) == 1

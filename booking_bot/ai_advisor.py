@@ -16,10 +16,15 @@ Key safety properties:
 """
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 from booking_bot import config
+
+log = logging.getLogger("ai_advisor")
 
 
 @dataclass(frozen=True)
@@ -136,3 +141,73 @@ def validate_decision(decision: Decision, snapshot: AdvisorSnapshot) -> bool:
         if label not in enabled_lower:
             return False
     return True
+
+
+class IncidentStore:
+    """Episodic memory for the advisor — an append-only JSONL corpus
+    of past stuck-state recoveries. Exact-match lookups by
+    (state, sorted_buttons) are the fast path that makes repeat
+    stucks free (no API call). Similarity lookups provide few-shot
+    context for novel stucks.
+
+    The backing file is hand-editable plain text. A malformed line
+    is logged and skipped; the rest of the file loads normally.
+
+    Thread-safety: not thread-safe. The bot is single-threaded for
+    row processing; this store is only touched from that thread.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._by_key: dict[str, dict] = {}
+        self._load()
+
+    def __len__(self) -> int:
+        return len(self._by_key)
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            log.info(
+                f"IncidentStore: {self.path} does not exist; "
+                f"starting with empty corpus"
+            )
+            return
+        loaded = 0
+        skipped = 0
+        for lineno, raw in enumerate(
+            self.path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as e:
+                log.warning(
+                    f"IncidentStore: skipping malformed line "
+                    f"{self.path}:{lineno}: {e}"
+                )
+                skipped += 1
+                continue
+            key = record.get("key")
+            if not key or not isinstance(key, str):
+                log.warning(
+                    f"IncidentStore: skipping line with missing key "
+                    f"{self.path}:{lineno}"
+                )
+                skipped += 1
+                continue
+            self._by_key[key] = record
+            loaded += 1
+        log.info(
+            f"IncidentStore: loaded {loaded} incidents from {self.path} "
+            f"(skipped {skipped} malformed lines)"
+        )
+
+    @staticmethod
+    def make_key(state: str, buttons: tuple[str, ...] | list[str]) -> str:
+        """Compute the canonical dict key for a (state, buttons) pair.
+        Public so the bootstrap script, tests, and runtime all agree on
+        the exact canonicalization: lowercase, stripped, sorted, joined."""
+        labels = sorted((b or "").strip().lower() for b in buttons)
+        return f"{state}|{'|'.join(labels)}"
