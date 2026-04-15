@@ -636,4 +636,175 @@ def test_consult_fast_path_skips_invalid_stored_incident(tmp_path):
         response=_fake_tool_use_response("click", "A", "fallback")
     )
     d = consult(snap, store, budget, client=client)
+    assert client.last_kwargs is not None
+    assert d is not None
+    assert d.button_label == "A"
+
+
+def test_consult_slow_path_click_passes_validation(tmp_path):
+    snap = AdvisorSnapshot(
+        state="UNKNOWN",
+        enabled_buttons=("Make Payment", "Previous Menu"),
+        last_bubble_text="payment pending",
+        recent_actions=("typed 9876543210",),
+        empty_input_names=(),
+        row_hint="row 42/500",
+    )
+    store = IncidentStore(tmp_path / "i.jsonl")
+    budget = AdvisorBudget()
+    client = FakeAnthropicClient(
+        response=_fake_tool_use_response("click", "Previous Menu", "escape")
+    )
+    d = consult(snap, store, budget, client=client)
+    assert d is not None
+    assert d.action == "click"
+    assert d.button_label == "Previous Menu"
+    assert client.last_kwargs is not None
+    assert budget.calls_made == 1
+    messages = client.last_kwargs["messages"]
+    user_content = "\n".join(
+        block["text"] if isinstance(block, dict) else block
+        for m in messages for block in (m["content"] if isinstance(m["content"], list) else [m["content"]])
+    )
+    assert "Make Payment" in user_content
+    assert "Previous Menu" in user_content
+
+
+def test_consult_slow_path_rejects_hallucinated_label(tmp_path):
+    snap = AdvisorSnapshot(
+        state="UNKNOWN",
+        enabled_buttons=("A", "B"),
+        last_bubble_text="",
+        recent_actions=(),
+        empty_input_names=(),
+        row_hint=None,
+    )
+    store = IncidentStore(tmp_path / "i.jsonl")
+    budget = AdvisorBudget()
+    client = FakeAnthropicClient(
+        response=_fake_tool_use_response("click", "Ghost Button", "invented")
+    )
+    d = consult(snap, store, budget, client=client)
     assert d is None
+    assert budget.calls_made == 1
+
+
+def test_consult_slow_path_reload_passes(tmp_path):
+    snap = AdvisorSnapshot(
+        state="UNKNOWN",
+        enabled_buttons=(),
+        last_bubble_text="",
+        recent_actions=(),
+        empty_input_names=(),
+        row_hint=None,
+    )
+    store = IncidentStore(tmp_path / "i.jsonl")
+    budget = AdvisorBudget()
+    client = FakeAnthropicClient(
+        response=_fake_tool_use_response("reload", None, "dom broken")
+    )
+    d = consult(snap, store, budget, client=client)
+    assert d is not None
+    assert d.action == "reload"
+
+
+def test_consult_slow_path_skip_row_passes(tmp_path):
+    snap = AdvisorSnapshot(
+        state="UNKNOWN",
+        enabled_buttons=("Make Payment",),
+        last_bubble_text="payment pending",
+        recent_actions=(),
+        empty_input_names=(),
+        row_hint="row 42/500",
+    )
+    store = IncidentStore(tmp_path / "i.jsonl")
+    budget = AdvisorBudget()
+    client = FakeAnthropicClient(
+        response=_fake_tool_use_response("skip_row", None, "payment pending this row")
+    )
+    d = consult(snap, store, budget, client=client)
+    assert d is not None
+    assert d.action == "skip_row"
+
+
+def test_consult_slow_path_api_timeout_returns_none(tmp_path):
+    snap = AdvisorSnapshot(
+        state="UNKNOWN",
+        enabled_buttons=("A",),
+        last_bubble_text="",
+        recent_actions=(),
+        empty_input_names=(),
+        row_hint=None,
+    )
+    store = IncidentStore(tmp_path / "i.jsonl")
+    budget = AdvisorBudget()
+    client = FakeAnthropicClient(raise_exc=TimeoutError("fake timeout"))
+    d = consult(snap, store, budget, client=client)
+    assert d is None
+    assert budget.calls_made == 1
+
+
+def test_consult_slow_path_generic_exception_returns_none(tmp_path):
+    snap = AdvisorSnapshot(
+        state="UNKNOWN",
+        enabled_buttons=("A",),
+        last_bubble_text="",
+        recent_actions=(),
+        empty_input_names=(),
+        row_hint=None,
+    )
+    store = IncidentStore(tmp_path / "i.jsonl")
+    budget = AdvisorBudget()
+    client = FakeAnthropicClient(raise_exc=RuntimeError("api exploded"))
+    d = consult(snap, store, budget, client=client)
+    assert d is None
+
+
+def test_consult_slow_path_no_tool_use_block_returns_none(tmp_path):
+    snap = AdvisorSnapshot(
+        state="UNKNOWN",
+        enabled_buttons=("A",),
+        last_bubble_text="",
+        recent_actions=(),
+        empty_input_names=(),
+        row_hint=None,
+    )
+    store = IncidentStore(tmp_path / "i.jsonl")
+    budget = AdvisorBudget()
+    client = FakeAnthropicClient(response=_fake_text_only_response("I refuse"))
+    d = consult(snap, store, budget, client=client)
+    assert d is None
+
+
+def test_consult_slow_path_passes_top_k_similar_as_few_shots(tmp_path):
+    path = tmp_path / "incidents.jsonl"
+    _write_incidents(path, [{
+        "key": IncidentStore.make_key("UNKNOWN", ["Other", "Previous Menu"]),
+        "state": "UNKNOWN",
+        "buttons_sorted": ["Other", "Previous Menu"],
+        "last_bubble_excerpt": "an old incident",
+        "chosen_action": {"action": "click", "button_label": "Previous Menu", "reason": "escape"},
+        "outcome": "recovered",
+        "recovered_to_state": "MAIN_MENU",
+        "source": "bootstrap",
+        "timestamp": "2026-04-15T00:00:00Z",
+        "occurrences": 1,
+    }])
+    snap = AdvisorSnapshot(
+        state="UNKNOWN",
+        enabled_buttons=("New Thing", "Previous Menu"),
+        last_bubble_text="",
+        recent_actions=(),
+        empty_input_names=(),
+        row_hint=None,
+    )
+    store = IncidentStore(path)
+    budget = AdvisorBudget()
+    client = FakeAnthropicClient(
+        response=_fake_tool_use_response("click", "Previous Menu", "similar")
+    )
+    d = consult(snap, store, budget, client=client)
+    assert d is not None
+    msgs = client.last_kwargs["messages"]
+    combined = json.dumps(msgs)
+    assert "an old incident" in combined

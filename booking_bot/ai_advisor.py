@@ -473,5 +473,176 @@ def consult(
             f"falling through to slow path"
         )
 
-    # Slow path (Task 11) not yet wired.
+    return _consult_slow_path(snapshot, store, budget, client=client)
+
+
+_ADVISOR_TOOL = {
+    "name": "decide",
+    "description": "Choose a single recovery action for the stuck bot.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["click", "reload", "skip_row"],
+            },
+            "button_label": {
+                "type": "string",
+                "description": "Required iff action=='click'. Must exactly match one of the enabled buttons.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "One sentence explaining the choice.",
+            },
+        },
+        "required": ["action", "reason"],
+    },
+}
+
+
+_SYSTEM_PROMPT = """\
+You are a recovery advisor for an HPCL gas booking bot. The bot is
+stuck and its deterministic rules cannot decide the next action. You
+must return exactly one action from a restricted action space.
+
+Allowed actions:
+  click     - click an existing button from the provided enabled list.
+              button_label must EXACTLY match one enabled button.
+  reload    - reload the chatbot page. Use when the DOM looks broken
+              (duplicate inputs, missing buttons, stale dialog).
+  skip_row  - mark the current customer row as failed and advance.
+              Use ONLY when the stuck state is specific to this row
+              (e.g. payment pending, duplicate booking, KYC issue).
+              Never use skip_row to escape a menu or UI glitch.
+
+Hard rules:
+- You may NEVER invent a button label not in the enabled list.
+- You may NEVER type text, fill inputs, or navigate URLs.
+- You may NEVER act on NEEDS_OPERATOR_AUTH or NEEDS_OPERATOR_OTP
+  states - those are handled deterministically.
+- Return ONE decide() tool call. No prose outside the tool call.
+
+Prefer click over reload. Prefer reload over skip_row. skip_row is
+the last resort and is rate-limited.
+"""
+
+
+def _build_user_prompt(snapshot: AdvisorSnapshot, few_shots: list[dict]) -> str:
+    """Render the user-side prompt. few_shots are the top-k similar
+    incidents from the store."""
+    lines = []
+    if few_shots:
+        lines.append("Past similar incidents (actions that worked before for stuck shapes like this one):")
+        for rec in few_shots:
+            lines.append(json.dumps({
+                "state": rec.get("state"),
+                "buttons": rec.get("buttons_sorted"),
+                "last_bubble_excerpt": rec.get("last_bubble_excerpt"),
+                "chosen_action": rec.get("chosen_action"),
+                "recovered_to_state": rec.get("recovered_to_state"),
+                "occurrences": rec.get("occurrences"),
+            }, ensure_ascii=False))
+        lines.append("")
+    lines.append("Current stuck state:")
+    lines.append(f"  state: {snapshot.state}")
+    lines.append(f"  enabled_buttons: {list(snapshot.enabled_buttons)}")
+    lines.append(f'  last_bubble_text: "{snapshot.last_bubble_text}"')
+    lines.append("  recent_actions:")
+    for a in snapshot.recent_actions:
+        lines.append(f"    - {a}")
+    lines.append(f"  row_hint: {snapshot.row_hint}")
+    lines.append("")
+    lines.append("What should the bot do next?")
+    return "\n".join(lines)
+
+
+def _extract_tool_call(message) -> dict | None:
+    """Pull the first tool_use block's input dict out of an Anthropic
+    Message. Returns None if no tool_use block is present or the
+    message shape is unexpected."""
+    content = getattr(message, "content", None)
+    if not content:
+        return None
+    for block in content:
+        btype = getattr(block, "type", None)
+        if btype == "tool_use":
+            return getattr(block, "input", None) or {}
     return None
+
+
+def _get_client(client):
+    """Return the caller-supplied client, or construct a real
+    anthropic.Anthropic if one wasn't provided."""
+    if client is not None:
+        return client
+    try:
+        import anthropic  # type: ignore
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            log.warning("ai_advisor: ANTHROPIC_API_KEY unset; advisor disabled this call")
+            return None
+        return anthropic.Anthropic(timeout=config.ADVISOR_API_TIMEOUT_S)
+    except Exception as e:
+        log.warning(f"ai_advisor: could not construct Anthropic client ({e})")
+        return None
+
+
+def _consult_slow_path(
+    snapshot: AdvisorSnapshot,
+    store: IncidentStore,
+    budget: AdvisorBudget,
+    *,
+    client,
+) -> Decision | None:
+    real_client = _get_client(client)
+    if real_client is None:
+        return None
+
+    few_shots = store.similar(snapshot.state, snapshot.enabled_buttons, top_k=5)
+    user_prompt = _build_user_prompt(snapshot, few_shots)
+
+    budget.record_call()
+
+    try:
+        response = real_client.messages.create(
+            model=config.ADVISOR_MODEL,
+            max_tokens=512,
+            system=_SYSTEM_PROMPT,
+            tools=[_ADVISOR_TOOL],
+            tool_choice={"type": "tool", "name": "decide"},
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+    except Exception as e:
+        log.warning(
+            f"ai_advisor: API call failed ({type(e).__name__}: {e}); "
+            f"advisor declined"
+        )
+        return None
+
+    tool_input = _extract_tool_call(response)
+    if tool_input is None:
+        log.warning("ai_advisor: API response had no tool_use block; advisor declined")
+        return None
+
+    decision = Decision(
+        action=tool_input.get("action", ""),
+        button_label=tool_input.get("button_label"),
+        reason=tool_input.get("reason", ""),
+    )
+
+    if not validate_decision(decision, snapshot):
+        log.warning(
+            f"ai_advisor: invalid decision rejected "
+            f"(action={decision.action!r} label={decision.button_label!r} "
+            f"enabled={list(snapshot.enabled_buttons)!r})"
+        )
+        return None
+
+    log.info(
+        f"ai_advisor: path=api state={snapshot.state!r} "
+        f"buttons={list(snapshot.enabled_buttons)!r} "
+        f"decision={decision.action}/{decision.button_label!r} "
+        f"reason={decision.reason!r} "
+        f"budget={budget.calls_made}/{budget.max_calls} "
+        f"skips={budget.total_skips}/{budget.max_total_skips}"
+    )
+    return decision
