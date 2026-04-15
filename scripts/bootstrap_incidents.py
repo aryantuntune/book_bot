@@ -142,3 +142,112 @@ def aggregate_incidents(incidents: list[dict]) -> dict[str, dict]:
                 agg[key]["timestamp"] = inc["timestamp"]
                 agg[key]["chosen_action"] = inc["chosen_action"]
     return agg
+
+
+def write_incidents(records: dict[str, dict], path: Path) -> None:
+    """Atomic write of the aggregated records to `path`. If `path`
+    already exists, merge the new records with the existing file,
+    preferring runtime-sourced records over bootstrap-sourced ones
+    on key collisions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing: dict[str, dict] = {}
+    if path.exists():
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "key" in rec:
+                existing[rec["key"]] = rec
+
+    merged: dict[str, dict] = dict(existing)
+    for key, new_rec in records.items():
+        prior = existing.get(key)
+        if prior is None:
+            merged[key] = new_rec
+        else:
+            if prior.get("source") == "runtime" and new_rec.get("source") == "bootstrap":
+                continue
+            merged[key] = new_rec
+
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".incidents.", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for rec in merged.values():
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        os.replace(tmp_name, path)
+    except Exception:
+        if os.path.exists(tmp_name):
+            try:
+                os.remove(tmp_name)
+            except OSError:
+                pass
+        raise
+
+
+def run_cli(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Seed data/incidents.jsonl from existing logs."
+    )
+    parser.add_argument(
+        "--logs-dir",
+        default="logs",
+        help="Directory to scan for *.log files (default: logs)",
+    )
+    parser.add_argument(
+        "--output",
+        default="data/incidents.jsonl",
+        help="Path to write the incidents.jsonl file (default: data/incidents.jsonl)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print summary only; do not write the output file",
+    )
+    args = parser.parse_args(argv)
+
+    logs_dir = Path(args.logs_dir)
+    out_path = Path(args.output)
+
+    all_incidents: list[dict] = []
+    log_files: list[Path] = sorted(logs_dir.glob("*.log"))
+    if not log_files:
+        print(f"bootstrap: no *.log files in {logs_dir}", file=sys.stderr)
+        return 1
+
+    for lf in log_files:
+        try:
+            all_incidents.extend(parse_log_file(lf))
+        except Exception as e:
+            print(f"bootstrap: skipping {lf.name}: {e}", file=sys.stderr)
+
+    agg = aggregate_incidents(all_incidents)
+
+    print(
+        f"bootstrapped {len(all_incidents)} incidents from "
+        f"{len(log_files)} log files; {len(agg)} unique keys"
+    )
+    top = sorted(agg.values(), key=lambda r: -r["occurrences"])[:10]
+    for rec in top:
+        print(
+            f"  {rec['occurrences']}x {rec['state']} buttons={rec['buttons_sorted']} "
+            f"-> click {rec['chosen_action']['button_label']!r}"
+        )
+
+    if args.dry_run:
+        print("dry-run: no file written")
+        return 0
+
+    write_incidents(agg, out_path)
+    print(f"wrote {out_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_cli())

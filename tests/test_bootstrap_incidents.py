@@ -55,3 +55,95 @@ def test_parse_log_ignores_stuck_without_recovery(tmp_path):
     from scripts.bootstrap_incidents import parse_log_file
     incidents = parse_log_file(log_path)
     assert incidents == []
+
+
+def test_write_incidents_to_new_file(tmp_path):
+    from scripts.bootstrap_incidents import write_incidents
+    path = tmp_path / "data" / "incidents.jsonl"
+    records = {
+        "UNKNOWN|a|b": {
+            "key": "UNKNOWN|a|b",
+            "state": "UNKNOWN",
+            "buttons_sorted": ["a", "b"],
+            "last_bubble_excerpt": "",
+            "chosen_action": {"action": "click", "button_label": "a", "reason": "r"},
+            "outcome": "recovered",
+            "recovered_to_state": "MAIN_MENU",
+            "source": "bootstrap",
+            "timestamp": "2026-04-15T00:00:00Z",
+            "occurrences": 1,
+        }
+    }
+    write_incidents(records, path)
+    assert path.exists()
+    loaded = path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(loaded) == 1
+    rec = json.loads(loaded[0])
+    assert rec["key"] == "UNKNOWN|a|b"
+
+
+def test_write_incidents_preserves_existing_runtime_records_on_key_collision(tmp_path):
+    """When merging bootstrap output into an existing file, runtime-sourced
+    records must not be overwritten by bootstrap records with the same key."""
+    from scripts.bootstrap_incidents import write_incidents
+    path = tmp_path / "incidents.jsonl"
+    existing = {
+        "key": "UNKNOWN|a|b",
+        "state": "UNKNOWN",
+        "buttons_sorted": ["a", "b"],
+        "last_bubble_excerpt": "runtime",
+        "chosen_action": {"action": "click", "button_label": "b", "reason": "runtime win"},
+        "outcome": "recovered",
+        "recovered_to_state": "MAIN_MENU",
+        "source": "runtime",
+        "timestamp": "2026-04-15T10:00:00Z",
+        "occurrences": 7,
+    }
+    path.write_text(json.dumps(existing) + "\n")
+
+    new_records = {
+        "UNKNOWN|a|b": {
+            "key": "UNKNOWN|a|b",
+            "state": "UNKNOWN",
+            "buttons_sorted": ["a", "b"],
+            "last_bubble_excerpt": "bootstrap",
+            "chosen_action": {"action": "click", "button_label": "a", "reason": "boot"},
+            "outcome": "recovered",
+            "recovered_to_state": "MAIN_MENU",
+            "source": "bootstrap",
+            "timestamp": "2026-04-15T00:00:00Z",
+            "occurrences": 1,
+        }
+    }
+    write_incidents(new_records, path)
+
+    loaded = [json.loads(l) for l in path.read_text().strip().splitlines()]
+    assert len(loaded) == 1
+    rec = loaded[0]
+    assert rec["source"] == "runtime"
+    assert rec["chosen_action"]["button_label"] == "b"
+
+
+def test_cli_dry_run_does_not_write_file(tmp_path, capsys):
+    from scripts.bootstrap_incidents import run_cli
+    out_path = tmp_path / "incidents.jsonl"
+    exit_code = run_cli([
+        "--logs-dir", str(FIXTURE.parent),
+        "--output", str(out_path),
+        "--dry-run",
+    ])
+    assert exit_code == 0
+    assert not out_path.exists()
+    captured = capsys.readouterr()
+    assert "bootstrapped" in captured.out.lower()
+
+
+def test_cli_writes_output_file(tmp_path):
+    from scripts.bootstrap_incidents import run_cli
+    out_path = tmp_path / "incidents.jsonl"
+    exit_code = run_cli([
+        "--logs-dir", str(FIXTURE.parent),
+        "--output", str(out_path),
+    ])
+    assert exit_code == 0
+    assert out_path.exists()
