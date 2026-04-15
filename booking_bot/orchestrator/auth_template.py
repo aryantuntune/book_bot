@@ -24,8 +24,45 @@ _SINGLETON_FILES = ("SingletonLock", "SingletonCookie", "SingletonSocket")
 _DEFAULT_LOCK = ("Default", "LOCK")
 
 
-def _seed_path(source: str) -> Path:
-    return config.ROOT / f".chromium-profile-{source}-auth-seed"
+def _seed_path(source: str, slot: str = "op1") -> Path:
+    """Auth-seed profile path for (source, slot). Slot is the operator
+    bucket label: op1, op2, ..., opK. Single-operator callers use the
+    default slot='op1'."""
+    return config.ROOT / f".chromium-profile-{source}-{slot}-auth-seed"
+
+
+def _seed_phone_meta_path(source: str, slot: str) -> Path:
+    """Path to the small JSON file sitting alongside each auth seed that
+    records which operator phone seeded it. Used by `start` to verify
+    that the `--operator-phones` argument still matches the seeds on
+    disk (guards against a reordered phone list between auth and start)."""
+    return _seed_path(source, slot) / "seed_phone.json"
+
+
+def _write_seed_phone(source: str, slot: str, phone: str) -> None:
+    """Record the operator phone used to create this slot's seed. Written
+    by `ensure_auth_seeds` after a successful interactive or Path-B seed.
+    Never raises — metadata is advisory, not load-bearing."""
+    path = _seed_phone_meta_path(source, slot)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"operator_phone": phone}), encoding="utf-8",
+        )
+    except OSError as e:
+        log.warning(f"could not write seed_phone.json for {source}/{slot}: {e}")
+
+
+def _read_seed_phone(source: str, slot: str) -> str | None:
+    """Return the phone recorded for this slot's seed, or None if missing
+    or corrupt. Never raises."""
+    path = _seed_phone_meta_path(source, slot)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    phone = data.get("operator_phone") if isinstance(data, dict) else None
+    return str(phone) if phone else None
 
 
 def _chunk_profile_path(profile_suffix: str) -> Path:

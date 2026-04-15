@@ -23,10 +23,12 @@ def auth_env(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _make_seed_profile(root: Path, source: str, *, fresh: bool = True) -> Path:
-    """Create a .chromium-profile-<source>-auth-seed/ dir with a
+def _make_seed_profile(
+    root: Path, source: str, *, fresh: bool = True, slot: str = "op1",
+) -> Path:
+    """Create a .chromium-profile-<source>-<slot>-auth-seed/ dir with a
     last_auth.json and one fake singleton lock file."""
-    seed = root / f".chromium-profile-{source}-auth-seed"
+    seed = root / f".chromium-profile-{source}-{slot}-auth-seed"
     seed.mkdir(parents=True, exist_ok=True)
     (seed / "Default").mkdir(exist_ok=True)
     (seed / "Default" / "Cookies").write_bytes(b"fake-cookie-db")
@@ -93,7 +95,7 @@ def test_clone_to_chunks_raises_aggregate_on_failures(auth_env, monkeypatch):
 
     calls = {"count": 0}
     orig_copytree = auth_template.shutil.copytree
-    seed_dir = auth_env / ".chromium-profile-TEST-auth-seed"
+    seed_dir = auth_env / ".chromium-profile-TEST-op1-auth-seed"
 
     def flaky_copytree(src, dst, *args, **kwargs):
         # Only fail on top-level clone calls (src == seed); shutil.copytree
@@ -124,7 +126,7 @@ def test_ensure_auth_seed_path_a_returns_fresh_seed_without_browser(
 
     monkeypatch.setattr(auth_template, "_interactive_auth_seed", explode)
     result = auth_template.ensure_auth_seed("TEST")
-    assert result == auth_env / ".chromium-profile-TEST-auth-seed"
+    assert result == auth_env / ".chromium-profile-TEST-op1-auth-seed"
     assert not launched["called"]
 
 
@@ -143,7 +145,7 @@ def test_ensure_auth_seed_path_b_copies_from_main_profile(auth_env, monkeypatch)
 
     monkeypatch.setattr(auth_template, "_interactive_auth_seed", explode)
     result = auth_template.ensure_auth_seed("TEST")
-    assert result == auth_env / ".chromium-profile-TEST-auth-seed"
+    assert result == auth_env / ".chromium-profile-TEST-op1-auth-seed"
     assert (result / "Default" / "Cookies").read_bytes() == b"main-cookies"
 
 
@@ -198,3 +200,35 @@ def test_auth_fresh_rejects_corrupt_json(auth_env):
     seed.mkdir(parents=True)
     (seed / "last_auth.json").write_text("not-json", encoding="utf-8")
     assert auth_template._auth_fresh(seed, max_age_s=3600) is False
+
+
+def test_seed_path_includes_slot(auth_env):
+    assert auth_template._seed_path("FOO", "op1") == (
+        auth_env / ".chromium-profile-FOO-op1-auth-seed"
+    )
+    assert auth_template._seed_path("FOO", "op3") == (
+        auth_env / ".chromium-profile-FOO-op3-auth-seed"
+    )
+
+
+def test_seed_path_defaults_to_op1(auth_env):
+    # Back-compat: callers that don't know about slots get op1.
+    assert auth_template._seed_path("BAR") == (
+        auth_env / ".chromium-profile-BAR-op1-auth-seed"
+    )
+
+
+def test_write_and_read_seed_phone(auth_env):
+    auth_template._write_seed_phone("FOO", "op2", "9876543210")
+    assert auth_template._read_seed_phone("FOO", "op2") == "9876543210"
+
+
+def test_read_seed_phone_missing_returns_none(auth_env):
+    assert auth_template._read_seed_phone("FOO", "op2") is None
+
+
+def test_read_seed_phone_corrupt_returns_none(auth_env):
+    seed = auth_env / ".chromium-profile-FOO-op2-auth-seed"
+    seed.mkdir(parents=True)
+    (seed / "seed_phone.json").write_text("not-json", encoding="utf-8")
+    assert auth_template._read_seed_phone("FOO", "op2") is None
