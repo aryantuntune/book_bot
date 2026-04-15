@@ -28,8 +28,8 @@ This is labor-intensive, fragile, and wastes CPU headroom on the laptops. The la
 3. **Single aggregate monitor.** `orchestrator monitor` shows a live table of every running chunk across every source with progress, phase, idle time, and totals. Detachable and re-attachable without killing chunks.
 4. **Restart and kill from the monitor.** One-keystroke restart of a stalled or failed chunk. One-keystroke stop of a whole source. No tracking which cmd window belongs to which chunk.
 5. **Browser visibility is a lever, not a constraint.** Chunks can launch with visible Chrome windows OR headless — it's a `start`-time flag (`--headed` / `--headless`, default headless). The monitor reads heartbeat files and is completely independent of browser visibility. If the operator wants 25 visible browsers tiled across the screen AND the monitor, they can. If they want 25 invisible ones AND just the monitor, they can.
-5. **One OTP entry per source per day.** `orchestrator auth --source <NAME>` captures an authenticated Chrome profile once, and all chunks for that source clone from it. You pick how many clones — the auth-seed profile is cloned to exactly as many targets as you requested with `--instances`/`--chunk-size`.
-6. **No new dependencies the operator can't install on Windows.** Must work on stock Python 3.12 + the existing project's deps + `rich`.
+6. **One OTP entry per source per day.** `orchestrator auth --source <NAME>` captures an authenticated Chrome profile once, and all chunks for that source clone from it. You pick how many clones — the auth-seed profile is cloned to exactly as many targets as you requested with `--instances`/`--chunk-size`.
+7. **No new dependencies the operator can't install on Windows.** Must work on stock Python 3.12 + the existing project's deps + `rich`.
 
 ## 3. Non-Goals
 
@@ -38,7 +38,7 @@ This is labor-intensive, fragile, and wastes CPU headroom on the laptops. The la
 - **Mid-run OTP flood prevention.** If all chunks of a source hit the 20 h cooldown simultaneously 20 h later, they will each demand OTP. This is the survivability spec's territory; orchestrator just surfaces the failures cleanly.
 - **Graphical UI.** Terminal-only. No web dashboard, no tray app, no Electron.
 - **Automatic output merging.** After all chunks of a source finish, the operator has per-chunk Output/Issues files tagged with the chunk id. Merging back into one file is a separate concern (can be added later as a 20-line utility).
-- **Aesthetically clean output filenames.** The existing bot's `ExcelStore` tags output files with `<input-stem>-<profile-suffix>.xlsx`. Since each chunk's input is already `<chunk-id>.xlsx` and the profile suffix is also `<chunk-id>`, output files land as `Output/<chunk-id>-<chunk-id>.xlsx` (e.g. `Output/ASU-03-ASU-03.xlsx`). Functional but ugly. Renaming is a cosmetic v2 concern — possible fix is adding a new `--output-suffix ""` flag to the existing bot CLI that overrides the profile-suffix-based tagging.
+- **Aesthetically clean output filenames.** The existing bot's `ExcelStore` tags output files with `<input-stem>-<profile-suffix>.xlsx`. Since each chunk's input is already `<chunk-id>.xlsx` and the profile suffix is also `<chunk-id>`, output files land as `Output/<chunk-id>-<chunk-id>.xlsx` (e.g. `Output/ASU-003-ASU-003.xlsx`). Functional but ugly. Renaming is a cosmetic v2 concern — possible fix is adding a new `--output-suffix ""` flag to the existing bot CLI that overrides the profile-suffix-based tagging.
 - **Dynamic re-chunking.** Chunk size is fixed per `start` call. If a chunk stalls hard, operator restarts it as a whole chunk; we don't re-split mid-run.
 
 ## 4. Prerequisites
@@ -67,8 +67,8 @@ This is labor-intensive, fragile, and wastes CPU headroom on the laptops. The la
        ▼                  ▼               ▼                 │              │
  Input/chunks/       .chromium-           ┌───────────┐      │              │
    ASU/              profile-             │ bot child │──────┘              │
-     *.xlsx          ASU-01..             │ process   │                     │
-                     ASU-07               │           │─ writes ─ data/runs/│
+     *.xlsx          ASU-001..            │ process   │                     │
+                     ASU-007              │           │─ writes ─ data/runs/│
                                           │ (headless)│      ASU/           │
                                           └───────────┘      *.heartbeat.json
                                                                             │
@@ -122,8 +122,9 @@ tests/fixtures/orchestrator/
 
 **Modified:**
 ```
-booking_bot/config.py     # + 4 path constants
+booking_bot/config.py     # + 3 path constants + 6 tuning constants (see §8)
 booking_bot/cli.py        # + _write_heartbeat() helper, + 8 call sites
+booking_bot/exceptions.py # + AuthSeedTimeout, AuthCloneFailed
 pyproject.toml            # + rich>=13
 ```
 
@@ -138,7 +139,7 @@ pyproject.toml            # + rich>=13
 @dataclass(frozen=True)
 class ChunkSpec:
     source: str            # operator-chosen, e.g. "ASU" or "indian-oil-feb"
-    chunk_id: str          # "<source>-<NN>", e.g. "ASU-03"
+    chunk_id: str          # "<source>-<NNN>", e.g. "ASU-003"
     chunk_index: int       # 3  (1-based)
     input_path: Path       # Input/chunks/<source>/<chunk_id>.xlsx
     profile_suffix: str    # same as chunk_id
@@ -159,10 +160,10 @@ def split(
 1. **Parallelism mode** — exactly one of `chunk_size` and `num_chunks` must be provided. Raises `ValueError("pass exactly one of chunk_size or num_chunks")` if both or neither are set.
    - `chunk_size=N` → every chunk has N rows (last one may be smaller); total chunk count is `ceil(total_rows / N)`.
    - `num_chunks=M` → exactly M chunks; size per chunk is `ceil(total_rows / M)` (last one may be smaller); if `M > total_rows`, raises `ValueError("num_chunks M exceeds row count R")`.
-2. `source` becomes the stem of the chunks subdir AND the prefix of each chunk filename. Example: operator passes `--source ASU` and `--input Input/ASU-Feb2026.xlsx`, chunks are written to `Input/chunks/ASU/ASU-01.xlsx`..`ASU-NN.xlsx`. The source string is the sole identity — the original input filename never appears in chunk names, profile suffixes, or heartbeat paths. The source name is operator-chosen; any name is valid as long as it passes validation below.
-3. Validates `source` matches `^[A-Za-z0-9_-]{1,32}$`. Raises `ValueError` otherwise.
+2. `source` becomes the stem of the chunks subdir AND the prefix of each chunk filename. Example: operator passes `--source ASU` and `--input Input/ASU-Feb2026.xlsx`, chunks are written to `Input/chunks/ASU/ASU-001.xlsx`..`ASU-NNN.xlsx`. The source string is the sole identity — the original input filename never appears in chunk names, profile suffixes, or heartbeat paths. The source name is operator-chosen; any name is valid as long as it passes validation below.
+3. Validates `source` matches `^[A-Za-z0-9_-]{1,28}$`. Raises `ValueError` otherwise. The 28-char cap is intentional: chunk ids become `<source>-<NNN>` (zero-padded to at least 3 digits for large runs), and the existing bot CLI caps `--profile-suffix` at 32 chars, so `28 + 1 + 3 = 32` is the tight bound. If the operator wants more than 999 chunks per source, shrink the source name further.
 4. Opens input xlsx with `openpyxl.load_workbook(read_only=True)`. Reads the header row (row 1) from the first sheet.
-5. Iterates data rows. Every `effective_chunk_size` rows, closes the current chunk workbook and starts a new one. Chunk numbering is 1-based, zero-padded to `max(2, len(str(N)))` digits so sorting works for any chunk count.
+5. Iterates data rows. Every `effective_chunk_size` rows, closes the current chunk workbook and starts a new one. Chunk numbering is 1-based, zero-padded to `max(3, len(str(N)))` digits so sorting works for any chunk count (3 is the minimum because the bot's profile-suffix cap is computed assuming `-NNN` — see the 28-char source name rule above).
 6. Each chunk workbook has exactly one sheet (same name as source input's first sheet), header row + up to `effective_chunk_size` data rows.
 7. Returns `list[ChunkSpec]` with all fields populated, in chunk-index order.
 8. **Idempotent:** If `Input/chunks/<source>/<chunk_id>.xlsx` already exists and its row count matches what we're about to write, skip writing and just return the ChunkSpec. Lets the operator re-run `start` without wasting disk writes.
@@ -310,8 +311,9 @@ def read_all(runs_dir: Path, source: str | None = None) -> list[Heartbeat]:
     """Glob + read all. If source given, filter to data/runs/<source>/*.json."""
 
 def mask_phone(phone: str) -> str:
-    """'9876543210' -> '98xxxxxx10'. Keeps first 2 + last 2, Xs middle.
-    Returns the input unchanged if len < 4."""
+    """'9876543210' -> '98xxxxxx10'. Keeps first 2 + last 2 characters,
+    replacing the middle with Xs. Returns the input unchanged if len <= 4
+    (there is nothing to mask)."""
 ```
 
 **Write:** JSON with `indent=2`. Write to `path.with_suffix(".tmp")`, `os.replace` to final path. Swallow `PermissionError` if the target is briefly locked (retry once after 50 ms), otherwise log and continue.
@@ -344,14 +346,17 @@ Three cooperating pieces inside `monitor.py`:
 **Command parser** (strict, no regex soup):
 
 ```
-r <chunk-id>       | restart <chunk-id>    → restart
-k <chunk-id>       | kill <chunk-id>       → kill
-start <src> <path> [size]                  → new source (size defaults to 500)
-stop <source>                              → stop all chunks of source
-q                                          → detach, chunks keep running
-qq                                         → stop all visible chunks, then exit
-h                  | help                  → show inline help
+r <chunk-id>       | restart <chunk-id>      → restart
+k <chunk-id>       | kill <chunk-id>         → kill
+start <src> <path> [--chunk-size N | --instances M] [--headed|--headless]
+                                             → new source (defaults: --chunk-size 500 --headless)
+stop <source>                                → stop all chunks of source
+q                                            → detach, chunks keep running
+qq                                           → stop all visible chunks, then exit
+h                  | help                    → show inline help
 ```
+
+The `start` subcommand inside the monitor mirrors the CLI `start` flags exactly — same mutual exclusions, same defaults — so the parser can be shared with `cli.py`. Internally the monitor shells out to `orchestrator.cli.run_start(...)` as a library call (not a subprocess), keeping everything in one process.
 
 Unknown commands print a red error and do nothing. Autocomplete is out of scope.
 
@@ -420,10 +425,10 @@ python -m booking_bot.orchestrator status [--source <SRC>] [--json]
 ```json
 {
   "source": "ASU",
-  "chunk_id": "ASU-03",
+  "chunk_id": "ASU-003",
   "pid": 12345,
-  "input_file": "Input/chunks/ASU/ASU-03.xlsx",
-  "profile_suffix": "ASU-03",
+  "input_file": "Input/chunks/ASU/ASU-003.xlsx",
+  "profile_suffix": "ASU-003",
   "phase": "booking",
   "rows_total": 500,
   "rows_done": 127,
@@ -433,7 +438,7 @@ python -m booking_bot.orchestrator status [--source <SRC>] [--json]
   "current_phone": "99xxxxxx99",
   "started_at": "2026-04-15T13:10:00+00:00",
   "last_activity_at": "2026-04-15T14:32:05+00:00",
-  "command": ["python","-m","booking_bot","Input/chunks/ASU/ASU-03.xlsx","--profile-suffix","ASU-03","--headless"],
+  "command": ["python","-m","booking_bot","Input/chunks/ASU/ASU-003.xlsx","--profile-suffix","ASU-003","--headless"],
   "exit_code": null,
   "last_error": null
 }
@@ -512,7 +517,7 @@ def _write_heartbeat(
 1. Right after `store = ExcelStore(...)` is constructed: `_write_heartbeat("starting", store)`.
 2. After the first successful `detect_state` that isn't an auth state: `_write_heartbeat("authenticating", store)` then on next loop `_write_heartbeat("booking", ...)`.
 3. Top of row loop, per iteration, BEFORE doing any work on the row: `_write_heartbeat("booking", store, current_row_idx=row_idx, current_phone=phone)`.
-4. After a row is marked done (inside the success branch, right after `store.mark_success(...)` or equivalent): `_write_heartbeat("booking", store, current_row_idx=row_idx, current_phone=phone)`.
+4. After a row is resolved (inside the success branch right after `store.write_success(code)`, or inside the failure branch right after `store.write_issue(...)` / `store.mark_terminal(...)`): `_write_heartbeat("booking", store, current_row_idx=row_idx, current_phone=phone)`. The names match `booking_bot/excel.py` — there is no `mark_success` method.
 5. Before calling `_recover_with_playbook` or any explicit reset path: `_write_heartbeat("recovering", store, current_row_idx=row_idx, current_phone=phone)`.
 6. Inside `wait_until_settled`'s quiet loop if total elapsed exceeds `ORCHESTRATOR_IDLE_WARNING_S` while waiting: `_write_heartbeat("idle", store, current_row_idx=row_idx, current_phone=phone)`. This keeps the timestamp fresh during legitimate long waits.
 7. Finally block at end of `main()`: `_write_heartbeat("completed" if store.summary()["pending"] == 0 else "failed", store)`.
@@ -551,14 +556,14 @@ def _write_heartbeat(
 - Empty input → `ValueError`.
 - Last-chunk-smaller case: 23 rows, size 5 → 5 chunks of 5,5,5,5,3.
 - Idempotent: call `split` twice, assert no rewrites on second call (use file mtimes).
-- Zero-padding: 12 chunks → `01..12`, 100 chunks → `001..100`, 7 chunks → `01..07`.
+- Zero-padding: 7 chunks → `001..007`, 12 chunks → `001..012`, 100 chunks → `001..100`, 1200 chunks → `0001..1200` (min 3 digits, widens as needed).
 - High chunk count sanity warning: `num_chunks=100` on a 500-row file → succeeds but emits a warning to stderr (we don't want to block power users, but we do want them to notice typos).
 
 **`test_orchestrator_heartbeat.py`:**
 - Round-trip: build Heartbeat, write to tmp path, read back → equal.
 - Malformed JSON: write garbage, `read()` returns None.
 - Missing file: `read()` returns None.
-- `mask_phone`: "9876543210" → "98xxxxxx10", "1234" → "12", "99" → "99", "" → "".
+- `mask_phone`: "9876543210" → "98xxxxxx10", "12345" → "12x45", "1234" → "1234" (len==4: first 2 + last 2 = whole string, no Xs to insert), "99" → "99" (len < 4, unchanged), "" → "" (unchanged).
 - Atomic write: write twice concurrently (threads), assert file is never half-written.
 
 **`test_orchestrator_auth_template.py`:**
@@ -635,7 +640,7 @@ Documented as a runbook in the spec, NOT automated:
 | Lock files inside Chrome profile dirs we don't know about | Clone then launch → Chrome complains. We scrub known lock files (`SingletonLock`, `SingletonCookie`, `SingletonSocket`, `Default/LOCK`). If unknown lock files surface in testing, add to the scrub list. |
 | A chunk zombie (PID exists but bot is hung inside Playwright) | Monitor's 10-min stall detector catches it. Auto-restart SIGTERMs and respawns. Budget of 3 auto-restarts prevents infinite restart loops. |
 
-**Rollback plan:** Orchestrator is purely additive. `booking_bot/orchestrator/` is one package — delete it and 4 lines from `pyproject.toml` and 10 lines from `booking_bot/cli.py` (`_write_heartbeat` calls) and the codebase returns to current behavior. Heartbeat writes in `cli.py` are env-gated no-ops when `BOOKING_BOT_HEARTBEAT_PATH` is unset, so manual runs are unaffected even if orchestrator files remain in place.
+**Rollback plan:** Orchestrator is purely additive. `booking_bot/orchestrator/` is one package — delete it, drop the `rich` line from `pyproject.toml`, and remove the `_write_heartbeat` helper plus its ~8 call sites from `booking_bot/cli.py`, and the codebase returns to current behavior. Even if you skip the `cli.py` cleanup, heartbeat writes are env-gated no-ops when `BOOKING_BOT_HEARTBEAT_PATH` is unset, so manual runs are unaffected even if orchestrator files remain in place.
 
 ## 14. Implementation order (for the plan that comes next)
 
