@@ -29,6 +29,8 @@ class ChunkSpec:
     profile_suffix: str
     heartbeat_path: Path
     row_count: int
+    operator_slot: str = "op1"
+    operator_phone: str = ""
 
 
 def _validate_source(source: str) -> None:
@@ -45,22 +47,46 @@ def split(
     *,
     chunk_size: int | None = None,
     num_chunks: int | None = None,
+    operator_phones: list[str] | None = None,
+    clones_per_operator: int = 3,
     output_dir: Path | None = None,
 ) -> list[ChunkSpec]:
-    """Split input_file into chunks. Exactly one of chunk_size / num_chunks
-    must be provided. Writes chunks to output_dir/<source>/<chunk-id>.xlsx
-    (default output_dir = config.CHUNKS_DIR). Returns ChunkSpec list in
-    chunk-index order. Idempotent: skips writing a chunk whose row count
-    already matches what's on disk."""
+    """Split input_file into chunks.
+
+    Two modes:
+      - Single-operator (legacy): pass exactly one of chunk_size /
+        num_chunks. All chunks get operator_slot='op1', operator_phone=''.
+      - Multi-operator: pass operator_phones=[...]. Produces
+        K*clones_per_operator contiguous chunks. First M chunks get
+        operator_slot='op1' and operator_phone=phones[0], next M -> op2,
+        and so on. `chunk_size`/`num_chunks` are ignored in this mode.
+
+    Writes chunks to output_dir/<source>/<chunk-id>.xlsx (default
+    output_dir = config.CHUNKS_DIR). Idempotent: skips writing a chunk
+    whose row count already matches what's on disk."""
     _validate_source(source)
-    if (chunk_size is None) == (num_chunks is None):
-        raise ValueError(
-            "pass exactly one of chunk_size or num_chunks to split()"
-        )
-    if chunk_size is not None and chunk_size <= 0:
-        raise ValueError(f"chunk_size must be positive; got {chunk_size}")
-    if num_chunks is not None and num_chunks <= 0:
-        raise ValueError(f"num_chunks must be positive; got {num_chunks}")
+
+    if operator_phones is not None:
+        if not operator_phones:
+            raise ValueError("operator_phones must be non-empty")
+        if not (1 <= clones_per_operator <= 3):
+            raise ValueError(
+                f"clones_per_operator must be between 1 and 3 (per-account "
+                f"session limit); got {clones_per_operator}"
+            )
+        n_chunks_override = len(operator_phones) * clones_per_operator
+        # Ignore chunk_size/num_chunks in multi-operator mode.
+        chunk_size = None
+        num_chunks = n_chunks_override
+    else:
+        if (chunk_size is None) == (num_chunks is None):
+            raise ValueError(
+                "pass exactly one of chunk_size or num_chunks to split()"
+            )
+        if chunk_size is not None and chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive; got {chunk_size}")
+        if num_chunks is not None and num_chunks <= 0:
+            raise ValueError(f"num_chunks must be positive; got {num_chunks}")
 
     input_file = Path(input_file)
     out_root = Path(output_dir) if output_dir is not None else config.CHUNKS_DIR
@@ -93,6 +119,15 @@ def split(
         chunk_path = chunks_dir / f"{chunk_id}.xlsx"
         heartbeat_path = config.RUNS_DIR / source / f"{chunk_id}.heartbeat.json"
         _write_chunk_file(chunk_path, header, rows_slice)
+
+        if operator_phones is not None:
+            op_idx = i // clones_per_operator
+            operator_slot = f"op{op_idx + 1}"
+            operator_phone = operator_phones[op_idx]
+        else:
+            operator_slot = "op1"
+            operator_phone = ""
+
         specs.append(ChunkSpec(
             source=source,
             chunk_id=chunk_id,
@@ -101,6 +136,8 @@ def split(
             profile_suffix=chunk_id,
             heartbeat_path=heartbeat_path,
             row_count=len(rows_slice),
+            operator_slot=operator_slot,
+            operator_phone=operator_phone,
         ))
     return specs
 
