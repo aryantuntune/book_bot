@@ -44,7 +44,25 @@ URL = (
     "https://hpchatbot.hpcl.co.in/pwa/view?data="
     "eyJlSWQiOjEwMCwiZ2xpIjp0cnVlLCJjYW1wYWlnbklkIjoiNjQ1MjAyZTNhMTdlMTZhY2RlOTNhMjhmIiwibGkiOiI4OWJiNzZlYTZlNmY0OTVjOTAwNTc3M2I1MGEzNDMyMSJ9"
 )
+# Env-var names the orchestrator spawner uses to tell a bot child which
+# operator slot/phone it owns. Defined here (not in orchestrator/) so
+# both config's import-time override and browser._shared_auth_path can
+# share a single authoritative constant.
+OPERATOR_PHONE_ENV = "BOOKING_BOT_OPERATOR_PHONE"
+OPERATOR_SLOT_ENV  = "BOOKING_BOT_OPERATOR_SLOT"
+
 OPERATOR_PHONE = "9209114429"   # operator edits this to their own number
+
+# If the child process was spawned by the orchestrator with
+# BOOKING_BOT_OPERATOR_PHONE set, that value wins over the module
+# default. This runs at import time so every subsequent read of
+# config.OPERATOR_PHONE (there are many) sees the right value without
+# plumbing a parameter through every call site.
+import os as _os
+_env_operator_phone = _os.environ.get(OPERATOR_PHONE_ENV, "").strip()
+if _env_operator_phone:
+    OPERATOR_PHONE = _env_operator_phone
+del _os, _env_operator_phone
 
 # ---- Timing (seconds unless suffixed _MS) ----
 # Tuned 2026-04-14 for throughput: original values were PACING_S=4.5 and
