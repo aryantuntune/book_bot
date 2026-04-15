@@ -460,3 +460,58 @@ def test_build_snapshot_coerces_nulls_to_empty():
     assert snap.last_bubble_text == ""
     assert snap.empty_input_names == ()
     assert snap.recent_actions == ()
+
+
+class FakeAnthropicClient:
+    """Stand-in for anthropic.Anthropic. Records the last messages.create
+    kwargs and returns whatever response the test configured.
+
+    The real Anthropic SDK's Message object has a .content attribute that
+    is a list of content blocks, and tool_use blocks have .type == 'tool_use'
+    and .input == <dict>. We mimic just enough of that shape.
+    """
+
+    def __init__(self, response=None, raise_exc=None):
+        self._response = response
+        self._raise = raise_exc
+        self.last_kwargs: dict | None = None
+        self.messages = self  # so client.messages.create(...) works
+
+    def create(self, **kwargs):
+        self.last_kwargs = kwargs
+        if self._raise is not None:
+            raise self._raise
+        return self._response
+
+
+class _Block:
+    """Minimal content block with .type and .input. Used to build a fake
+    messages.create response without importing the real SDK types."""
+    def __init__(self, block_type: str, input_: dict | None = None, text: str = ""):
+        self.type = block_type
+        self.input = input_ or {}
+        self.text = text
+
+
+class _Msg:
+    def __init__(self, blocks):
+        self.content = blocks
+
+
+def _fake_tool_use_response(action, button_label, reason):
+    return _Msg([_Block("tool_use", input_={
+        "action": action,
+        "button_label": button_label,
+        "reason": reason,
+    })])
+
+
+def _fake_text_only_response(text="sorry"):
+    return _Msg([_Block("text", text=text)])
+
+
+def test_fake_client_records_kwargs():
+    client = FakeAnthropicClient(response=_fake_tool_use_response("reload", None, "r"))
+    result = client.messages.create(model="x", messages=[{"role": "user", "content": "hi"}])
+    assert client.last_kwargs["model"] == "x"
+    assert result.content[0].type == "tool_use"
