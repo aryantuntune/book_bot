@@ -590,10 +590,16 @@ def _quiet_retry_until_alive_or_dead(page, pb, store) -> str:
                     "(operator manual auth, shared-auth transplant, or "
                     "HPCL self-heal)"
                 )
-                # If we just transplanted a working cookie, persist our
-                # own auth timestamp so this instance participates in the
-                # 20h cooldown protection going forward.
+                # Persist our own auth timestamp so this instance
+                # participates in the 20h cooldown protection going
+                # forward, AND write shared_auth.json so other stuck
+                # parallel instances pick up this manual auth on their
+                # next quiet-retry tick. Without this propagation, a
+                # manual re-auth would heal this instance but leave
+                # every other stuck parallel instance looping — which
+                # defeats the entire point of Option B.
                 browser.mark_auth_success()
+                browser.write_shared_auth_state(page)
                 return "alive"
         except Exception as e:
             log.debug(
