@@ -39,12 +39,10 @@ def main() -> int:
         time.sleep(0.1)
     # Side file: record env var values so test_env_var_propagation can check them.
     side = path.parent / f"{chunk}.env.txt"
-    side.write_text(
-        f"BOOKING_BOT_HEARTBEAT_PATH={hb_path}\n"
-        f"BOOKING_BOT_SOURCE={source}\n"
-        f"BOOKING_BOT_CHUNK_ID={chunk}\n",
-        encoding="utf-8",
-    )
+    with open(side, "w", encoding="utf-8") as f:
+        for k, v in os.environ.items():
+            if k.startswith("BOOKING_BOT_"):
+                f.write(f"{k}={v}\n")
     return 0
 
 

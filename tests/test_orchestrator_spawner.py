@@ -103,6 +103,30 @@ def test_spawn_chunk_headless_flag_controls_cmd(spawner_env, monkeypatch):
     assert any("--headless" not in c for c in calls)
 
 
+def test_spawn_chunk_sets_operator_env_vars(spawner_env, monkeypatch):
+    """Multi-operator env vars reach the child process."""
+    monkeypatch.setenv("BOOKING_BOT_SPAWNER_CMD_OVERRIDE", f"{sys.executable}|{FAKE_BOT}")
+    (spawner_env / "fake.xlsx").write_text("")
+    spec = ChunkSpec(
+        source="FAKE",
+        chunk_id="FAKE-004",
+        chunk_index=4,
+        input_path=spawner_env / "fake.xlsx",
+        profile_suffix="FAKE-004",
+        heartbeat_path=spawner_env / "runs" / "FAKE" / "FAKE-004.heartbeat.json",
+        row_count=3,
+        operator_slot="op2",
+        operator_phone="9222222222",
+    )
+    handle = spawner.spawn_chunk(spec, headed=False)
+    handle.popen.wait(timeout=10)
+    env_file = spec.heartbeat_path.parent / f"{spec.chunk_id}.env.txt"
+    assert env_file.exists()
+    text = env_file.read_text(encoding="utf-8")
+    assert "BOOKING_BOT_OPERATOR_SLOT=op2" in text
+    assert "BOOKING_BOT_OPERATOR_PHONE=9222222222" in text
+
+
 def test_kill_chunk_terminates_a_long_running_child(spawner_env, monkeypatch):
     slow_script = spawner_env / "slow.py"
     slow_script.write_text("import time; time.sleep(30)\n")

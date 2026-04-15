@@ -100,9 +100,11 @@ def spawn_chunk(spec: ChunkSpec, *, headed: bool = False) -> ChildHandle:
     err_f = stderr_log.open("ab")
 
     env = os.environ.copy()
-    env["BOOKING_BOT_HEARTBEAT_PATH"] = str(spec.heartbeat_path)
+    env["BOOKING_BOT_HEARTBEAT_PATH"]  = str(spec.heartbeat_path)
     env["BOOKING_BOT_SOURCE"]          = spec.source
     env["BOOKING_BOT_CHUNK_ID"]        = spec.chunk_id
+    env["BOOKING_BOT_OPERATOR_SLOT"]   = spec.operator_slot
+    env["BOOKING_BOT_OPERATOR_PHONE"]  = spec.operator_phone
 
     popen = subprocess.Popen(
         cmd,
