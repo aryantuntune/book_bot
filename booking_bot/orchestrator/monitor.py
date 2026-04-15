@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import shlex
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable
 
@@ -198,3 +199,36 @@ def _parse_start(tokens: list[str]) -> tuple[str, dict]:
     if args["chunk_size"] is None and args["instances"] is None:
         args["chunk_size"] = 500
     return ("start", args)
+
+
+_LIVE_PHASES = {"booking", "recovering", "idle", "starting", "authenticating"}
+
+
+def is_stalled(hb: Heartbeat, *, threshold_s: float) -> bool:
+    """True when hb.last_activity_at is older than threshold_s AND the
+    heartbeat is still in a live phase. Completed and failed chunks are
+    never stalled."""
+    if hb.phase not in _LIVE_PHASES:
+        return False
+    return _idle_seconds(hb) > threshold_s
+
+
+@dataclass
+class RestartBudget:
+    """Per-chunk auto-restart counter. consume() returns True if the
+    chunk is allowed one more auto-restart, False once the budget is
+    exhausted. A chunk that exhausts its budget is surfaced in the
+    monitor with last_error='auto-restart budget exhausted'."""
+
+    max_per_chunk: int
+    _counts: dict[str, int] = field(default_factory=dict)
+
+    def consume(self, chunk_id: str) -> bool:
+        used = self._counts.get(chunk_id, 0)
+        if used >= self.max_per_chunk:
+            return False
+        self._counts[chunk_id] = used + 1
+        return True
+
+    def reset(self, chunk_id: str) -> None:
+        self._counts.pop(chunk_id, None)

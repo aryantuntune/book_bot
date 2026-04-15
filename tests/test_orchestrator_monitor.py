@@ -126,3 +126,42 @@ def test_parse_command_unknown_returns_error():
 def test_parse_command_empty_returns_noop():
     assert monitor.parse_command("") == ("noop", {})
     assert monitor.parse_command("   ") == ("noop", {})
+
+
+def test_is_stalled_true_when_last_activity_exceeds_threshold():
+    old = (datetime.now(tz=timezone.utc) - timedelta(minutes=15)).isoformat()
+    hb = _hb("TEST-001", last_activity_at=old)
+    assert monitor.is_stalled(hb, threshold_s=600) is True
+
+
+def test_is_stalled_false_for_recent_heartbeat():
+    hb = _hb("TEST-001")
+    assert monitor.is_stalled(hb, threshold_s=600) is False
+
+
+def test_is_stalled_false_for_completed_phase():
+    old = (datetime.now(tz=timezone.utc) - timedelta(minutes=15)).isoformat()
+    hb = _hb("TEST-001", phase="completed", last_activity_at=old)
+    assert monitor.is_stalled(hb, threshold_s=600) is False
+
+
+def test_is_stalled_false_for_failed_phase():
+    old = (datetime.now(tz=timezone.utc) - timedelta(minutes=15)).isoformat()
+    hb = _hb("TEST-001", phase="failed", last_activity_at=old)
+    assert monitor.is_stalled(hb, threshold_s=600) is False
+
+
+def test_restart_budget_allows_first_n_then_refuses():
+    budget = monitor.RestartBudget(max_per_chunk=3)
+    assert budget.consume("TEST-001") is True
+    assert budget.consume("TEST-001") is True
+    assert budget.consume("TEST-001") is True
+    assert budget.consume("TEST-001") is False  # 4th refused
+
+
+def test_restart_budget_is_per_chunk():
+    budget = monitor.RestartBudget(max_per_chunk=2)
+    assert budget.consume("TEST-001") is True
+    assert budget.consume("TEST-001") is True
+    assert budget.consume("TEST-002") is True  # different chunk — own budget
+    assert budget.consume("TEST-001") is False
