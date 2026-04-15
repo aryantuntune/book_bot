@@ -81,7 +81,7 @@ MAX_CONSECUTIVE_ROW_FAILURES = 5
 # one real OTP SMS. Any NEEDS_OPERATOR_AUTH detection inside the cooldown
 # window is routed through Section 3's quiet retry loop instead of
 # typing the phone (which would burn operator OTP quota for nothing).
-AUTH_COOLDOWN_S              = 10800   # 3h
+AUTH_COOLDOWN_S              = 72000   # 20h — observed HPCL session lifetime is ~15h, +5h headroom
 # IN_PLACE_POLL_S: how long recover_session / _recover_with_playbook
 # should keep polling the in-place frame for a non-UNKNOWN state before
 # falling back to a full page reload. Larger values mean more chances to
