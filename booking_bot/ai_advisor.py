@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -254,3 +257,66 @@ class IncidentStore:
             ),
         )
         return [rec for (_score, rec) in candidates[:top_k]]
+
+    def record_success(
+        self,
+        snapshot: AdvisorSnapshot,
+        decision: Decision,
+        recovered_to: str,
+    ) -> None:
+        """Append/update an incident for a successful advisor-driven
+        recovery. If the exact (state, buttons) key already exists,
+        increment occurrences and update the timestamp. Otherwise
+        create a new record with occurrences=1 and source='runtime'.
+        Flushes the whole file atomically after every write."""
+        key = self.make_key(snapshot.state, snapshot.enabled_buttons)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        existing = self._by_key.get(key)
+        if existing is not None:
+            existing["occurrences"] = int(existing.get("occurrences", 1)) + 1
+            existing["timestamp"] = now
+            existing["recovered_to_state"] = recovered_to
+            existing["chosen_action"] = {
+                "action": decision.action,
+                "button_label": decision.button_label,
+                "reason": decision.reason,
+            }
+        else:
+            record = {
+                "key": key,
+                "state": snapshot.state,
+                "buttons_sorted": sorted(snapshot.enabled_buttons),
+                "last_bubble_excerpt": (snapshot.last_bubble_text or "")[:500],
+                "chosen_action": {
+                    "action": decision.action,
+                    "button_label": decision.button_label,
+                    "reason": decision.reason,
+                },
+                "outcome": "recovered",
+                "recovered_to_state": recovered_to,
+                "source": "runtime",
+                "timestamp": now,
+                "occurrences": 1,
+            }
+            self._by_key[key] = record
+        self._flush()
+
+    def _flush(self) -> None:
+        """Atomic write-to-temp + rename. Guarantees the jsonl file is
+        either the old content or the new content, never a half-write."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=".incidents.", suffix=".tmp", dir=str(self.path.parent)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                for rec in self._by_key.values():
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            os.replace(tmp_name, self.path)
+        except Exception:
+            if os.path.exists(tmp_name):
+                try:
+                    os.remove(tmp_name)
+                except OSError:
+                    pass
+            raise

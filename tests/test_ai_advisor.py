@@ -332,3 +332,71 @@ def test_incident_store_similar_respects_top_k(tmp_path):
     store = IncidentStore(path)
     similar = store.similar("UNKNOWN", ("b0",), top_k=3)
     assert len(similar) == 3
+
+
+def test_incident_store_record_success_new_incident(tmp_path):
+    path = tmp_path / "incidents.jsonl"
+    store = IncidentStore(path)
+    snap = AdvisorSnapshot(
+        state="UNKNOWN",
+        enabled_buttons=("Make Payment", "Previous Menu"),
+        last_bubble_text="payment pending",
+        recent_actions=(),
+        empty_input_names=(),
+        row_hint=None,
+    )
+    decision = Decision(
+        action="click",
+        button_label="Previous Menu",
+        reason="dead-end payment dialog",
+    )
+    store.record_success(snap, decision, recovered_to="BOOK_FOR_OTHERS_MENU")
+    assert len(store) == 1
+    assert path.exists()
+    reloaded = IncidentStore(path)
+    assert len(reloaded) == 1
+    hit = reloaded.lookup_exact("UNKNOWN", ("Make Payment", "Previous Menu"))
+    assert hit is not None
+    assert hit["chosen_action"]["button_label"] == "Previous Menu"
+    assert hit["occurrences"] == 1
+    assert hit["source"] == "runtime"
+
+
+def test_incident_store_record_success_dedupes_and_increments(tmp_path):
+    path = tmp_path / "incidents.jsonl"
+    store = IncidentStore(path)
+    snap = AdvisorSnapshot(
+        state="UNKNOWN",
+        enabled_buttons=("A", "B"),
+        last_bubble_text="",
+        recent_actions=(),
+        empty_input_names=(),
+        row_hint=None,
+    )
+    d = Decision(action="click", button_label="A", reason="pick A")
+    store.record_success(snap, d, recovered_to="MAIN_MENU")
+    store.record_success(snap, d, recovered_to="MAIN_MENU")
+    store.record_success(snap, d, recovered_to="MAIN_MENU")
+    assert len(store) == 1
+    hit = store.lookup_exact("UNKNOWN", ("A", "B"))
+    assert hit["occurrences"] == 3
+
+
+def test_incident_store_flush_is_atomic(tmp_path, monkeypatch):
+    path = tmp_path / "incidents.jsonl"
+    store = IncidentStore(path)
+    snap = AdvisorSnapshot(
+        state="UNKNOWN",
+        enabled_buttons=("A",),
+        last_bubble_text="",
+        recent_actions=(),
+        empty_input_names=(),
+        row_hint=None,
+    )
+    store.record_success(
+        snap,
+        Decision(action="reload", button_label=None, reason="test"),
+        recovered_to="MAIN_MENU",
+    )
+    tmp_files = list(tmp_path.glob("*.tmp"))
+    assert tmp_files == []
