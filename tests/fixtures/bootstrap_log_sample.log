@@ -1,0 +1,15 @@
+2026-04-13 19:32:27 INFO chat: detect_state -> MAIN_MENU
+2026-04-13 19:32:28 INFO playbook: clicked 'Booking Services' (id=b1)
+2026-04-13 19:32:30 INFO chat: detect_state -> BOOK_FOR_OTHERS_MENU
+2026-04-13 19:32:31 INFO playbook: clicked 'Book for Others' (id=b2)
+2026-04-13 19:32:33 INFO chat: detect_state -> UNKNOWN
+2026-04-13 19:32:34 WARNING playbook: reset stuck on dead-end dialog (enabled=['Make Payment', 'Previous Menu']); clicking 'Previous Menu' to back out and retrying reset
+2026-04-13 19:32:35 INFO playbook: clicked 'Previous Menu' (id=bprev)
+2026-04-13 19:32:37 INFO chat: detect_state -> BOOK_FOR_OTHERS_MENU
+2026-04-13 19:32:39 INFO playbook: clicked 'Book for Others' (id=b2)
+2026-04-13 19:32:41 INFO chat: detect_state -> READY_FOR_CUSTOMER
+2026-04-13 19:32:42 INFO chat: typed customer phone 9876543210
+2026-04-13 19:33:00 INFO chat: detect_state -> UNKNOWN
+2026-04-13 19:33:01 WARNING playbook: reset stuck on dead-end dialog (enabled=['Make Payment', 'Previous Menu']); clicking 'Previous Menu' to back out and retrying reset
+2026-04-13 19:33:02 INFO playbook: clicked 'Previous Menu' (id=bprev)
+2026-04-13 19:33:04 INFO chat: detect_state -> BOOK_FOR_OTHERS_MENU
