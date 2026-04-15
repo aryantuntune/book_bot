@@ -29,6 +29,7 @@ from booking_bot.exceptions import (
     ChromeNotInstalledError,
     GatewayError,
     IframeLostError,
+    ProfileInUseError,
 )
 
 log = logging.getLogger("browser")
@@ -39,6 +40,11 @@ _gateway_error_seen = False
 PROFILE_DIR_NAME = ".chrome-profile"
 CHROMIUM_PROFILE_DIR_NAME = ".chromium-profile"
 _LAST_AUTH_FILENAME = "last_auth.json"
+
+# Set by start_browser() to the profile dir actually in use. Read by
+# _last_auth_path() so the auth-cooldown file follows the suffixed profile
+# instead of leaking across parallel instances.
+_active_profile_dir: Path | None = None
 
 
 def reset_gateway_flag() -> None:
@@ -61,7 +67,13 @@ def _last_auth_path() -> Path:
     """Disk location of the auth timestamp file. Lives inside the same
     persistent profile dir as the chrome cookies so wiping the profile
     also wipes the cooldown in one shot. Resolved lazily because
-    config.ROOT is read-through and tests monkeypatch it."""
+    config.ROOT is read-through and tests monkeypatch it.
+
+    Prefers the active profile dir set by start_browser() so --profile-suffix
+    runs read/write the cooldown file inside their own suffixed directory
+    rather than sharing one file across parallel instances."""
+    if _active_profile_dir is not None:
+        return _active_profile_dir / _LAST_AUTH_FILENAME
     return Path(config.ROOT) / CHROMIUM_PROFILE_DIR_NAME / _LAST_AUTH_FILENAME
 
 
@@ -115,6 +127,7 @@ def clear_auth_cooldown() -> None:
 def start_browser(
     headless: bool = False,
     use_system_chrome: bool = False,
+    profile_suffix: str | None = None,
 ) -> tuple[Playwright, Browser | None, BrowserContext, Page]:
     """Launch Chromium against a persistent user-data dir so that cookies,
     local storage, and service-worker caches survive across runs. This
@@ -148,8 +161,16 @@ def start_browser(
     """
     pw = sync_playwright().start()
     profile_name = PROFILE_DIR_NAME if use_system_chrome else CHROMIUM_PROFILE_DIR_NAME
+    if profile_suffix:
+        profile_name = f"{profile_name}-{profile_suffix}"
     profile_dir = config.ROOT / profile_name
     profile_dir.mkdir(parents=True, exist_ok=True)
+    global _active_profile_dir
+    _active_profile_dir = profile_dir
+    # Prominent log so operators running parallel instances can visually
+    # confirm which profile this terminal is driving. Shown at INFO so it
+    # appears in the console even without --debug.
+    log.info(f"using profile dir: {profile_dir}")
     launch_kwargs: dict = {
         "user_data_dir": str(profile_dir),
         "headless": headless,
@@ -166,6 +187,37 @@ def start_browser(
         ctx = pw.chromium.launch_persistent_context(**launch_kwargs)
     except Exception as launch_err:
         msg = str(launch_err)
+        # Failure path must unset _active_profile_dir so a later
+        # _last_auth_path() caller doesn't read/write a cooldown file
+        # inside a profile whose browser never actually came up.
+        _active_profile_dir = None
+        try:
+            pw.stop()
+        except Exception:
+            pass
+        # Chromium refuses to open a user-data-dir that another chrome.exe
+        # already holds. It prints "Opening in existing browser session"
+        # to stdout and exits, which Playwright surfaces as a generic
+        # TargetClosedError. Detect that specific pattern and re-raise as
+        # ProfileInUseError so the CLI can show an actionable message
+        # instead of dumping a 40-line traceback.
+        if "Opening in existing browser session" in msg or (
+            "TargetClosedError" in type(launch_err).__name__
+            and "launch_persistent_context" in msg
+        ):
+            raise ProfileInUseError(
+                f"Chromium profile already in use: {profile_dir}\n\n"
+                f"Another booking_bot instance is running against this same "
+                f"profile directory (Chromium enforces a single-writer lock "
+                f"on its user-data-dir).\n\n"
+                f"To run multiple bots in parallel:\n"
+                f"  1. Keep the existing terminal running, AND\n"
+                f"  2. In this terminal, pick a different --profile-suffix:\n"
+                f"       python -m booking_bot <input> --profile-suffix 2\n\n"
+                f"If no other bot is running, a previous run may have crashed "
+                f"without releasing its lock. Close any stray chrome.exe "
+                f"processes that still have this profile open, then retry."
+            ) from launch_err
         # Playwright's error when Chrome/Chromium can't be found mentions
         # "Executable doesn't exist" and a chromium-1134 path. Re-raise as
         # a ChromeNotInstalledError with a download link so the GUI bootstrap
@@ -176,10 +228,6 @@ def start_browser(
             or "chromium-1134" in msg
             or "channel" in msg.lower()
         ):
-            try:
-                pw.stop()
-            except Exception:
-                pass
             raise ChromeNotInstalledError(
                 "Google Chrome is not installed on this computer.\n\n"
                 "The HP Gas Booking Bot uses your installed Chrome to talk\n"

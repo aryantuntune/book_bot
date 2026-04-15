@@ -79,6 +79,7 @@ def normalize_phone(raw: object) -> tuple[str, str | None]:
 
 _USE_GUI_OTP = False
 _HEADLESS = False
+_PROFILE_SUFFIX: str | None = None
 
 
 def _start_idle_alert() -> threading.Event:
@@ -271,12 +272,14 @@ def main() -> None:
             chat.wait_until_settled(_pre_frame)
             startup_state = chat.detect_state(_pre_frame)
         except Exception as e:
-            from booking_bot.exceptions import ChromeNotInstalledError
+            from booking_bot.exceptions import ChromeNotInstalledError, ProfileInUseError
             import tkinter as _tk
             import tkinter.messagebox as _mb
             _root = _tk.Tk(); _root.withdraw()
             if isinstance(e, ChromeNotInstalledError):
                 _mb.showerror("Google Chrome not installed", str(e))
+            elif isinstance(e, ProfileInUseError):
+                _mb.showerror("HP Gas Booking Bot already running", str(e))
             else:
                 _mb.showerror(
                     "Startup failed",
@@ -320,6 +323,7 @@ def main() -> None:
             keep_open=values["keep_open"],
             playbook=None,
             no_playbook=False,
+            profile_suffix=None,
         )
     else:
         ap = argparse.ArgumentParser(prog="python -m booking_bot")
@@ -352,15 +356,40 @@ def main() -> None:
             "so no OTP prompt is needed. Skips the startup GUI dialog and "
             "does not allocate a console window.",
         )
+        ap.add_argument(
+            "--profile-suffix",
+            type=str,
+            default=None,
+            help="tag this run with its own Chromium profile directory so "
+            "multiple booking_bot instances can run in parallel from the "
+            "same folder without colliding on the browser user-data lock. "
+            "Example: --profile-suffix 2 uses .chromium-profile-2/ instead "
+            "of .chromium-profile/ and writes Output/<name>-2.xlsx so the "
+            "two runs don't overwrite each other. Each suffix is a separate "
+            "HPCL session — first run of each new suffix needs its own OTP.",
+        )
         args = ap.parse_args()
-        global _HEADLESS
+        if args.profile_suffix is not None:
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", args.profile_suffix):
+                ap.error(
+                    "--profile-suffix must be alphanumeric (dashes and "
+                    "underscores allowed); got: " + repr(args.profile_suffix)
+                )
+            if len(args.profile_suffix) > 32:
+                ap.error(
+                    "--profile-suffix must be 32 characters or fewer "
+                    f"(got {len(args.profile_suffix)}); long suffixes risk "
+                    "pushing the Chromium user-data path past Windows MAX_PATH."
+                )
+        global _HEADLESS, _PROFILE_SUFFIX
         _HEADLESS = args.headless
+        _PROFILE_SUFFIX = args.profile_suffix
 
     log_path = setup_logging(debug=args.debug)
     log.info(f"booking_bot starting; log file: {log_path}")
     log.info(f"input file: {args.input_file}")
 
-    store = ExcelStore(args.input_file)
+    store = ExcelStore(args.input_file, output_suffix=args.profile_suffix)
     log.info(f"initial summary: {store.summary()}")
     log.info(store.progress_line())
 
@@ -568,6 +597,7 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
         else:
             pw, browser_obj, ctx, page = browser.start_browser(
                 headless=_HEADLESS,
+                profile_suffix=_PROFILE_SUFFIX,
             )
             # Initial frame acquisition + settle can fail when HPCL navigates
             # the page mid-wait (observed: frame destroyed ~50s after load,

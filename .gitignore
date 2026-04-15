@@ -18,9 +18,12 @@ logs/
 .claude/
 
 # Persistent chromium profile (cookies, local storage, service-worker cache)
-# — private to each operator, never commit
+# — private to each operator, never commit. Wildcards cover suffixed profiles
+# created by --profile-suffix (.chromium-profile-2/, .chromium-profile-alt/ …).
 .chrome-profile/
+.chrome-profile-*/
 .chromium-profile/
+.chromium-profile-*/
 
 # PyInstaller build artifacts
 build/

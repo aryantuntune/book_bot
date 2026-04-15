@@ -22,10 +22,11 @@ log = logging.getLogger("excel")
 
 
 class ExcelStore:
-    def __init__(self, input_path: Path) -> None:
+    def __init__(self, input_path: Path, output_suffix: str | None = None) -> None:
         self.input_path = Path(input_path)
-        self.output_path = config.OUTPUT_DIR / self.input_path.name
-        self.issues_path = config.ISSUES_DIR / self.input_path.name
+        self.output_suffix = output_suffix or None
+        self.output_path = self._derive_output_path(config.OUTPUT_DIR, self.input_path)
+        self.issues_path = self._derive_output_path(config.ISSUES_DIR, self.input_path)
 
         config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         config.ISSUES_DIR.mkdir(parents=True, exist_ok=True)
@@ -33,7 +34,8 @@ class ExcelStore:
         # Handle .xls legacy input (§7.1). Normalize self.input_path to .xlsx.
         if self.input_path.suffix.lower() == ".xls":
             self.input_path = self._convert_xls_to_xlsx(self.input_path)
-            self.output_path = config.OUTPUT_DIR / self.input_path.name
+            self.output_path = self._derive_output_path(config.OUTPUT_DIR, self.input_path)
+            self.issues_path = self._derive_output_path(config.ISSUES_DIR, self.input_path)
 
         if not self.output_path.exists():
             shutil.copy2(self.input_path, self.output_path)
@@ -45,6 +47,16 @@ class ExcelStore:
         self._ws = self._wb.active
         self._issues_wb: openpyxl.Workbook | None = None
         self._issues_ws = None
+
+    def _derive_output_path(self, folder: Path, input_path: Path) -> Path:
+        """Compose the Output/Issues path for an input file, tagging it with
+        the active --profile-suffix so two instances running from the same
+        repo don't overwrite each other's workbooks. No suffix → legacy
+        behavior (file name identical to input)."""
+        if not self.output_suffix:
+            return folder / input_path.name
+        stem, ext = input_path.stem, input_path.suffix
+        return folder / f"{stem}-{self.output_suffix}{ext}"
 
     def _convert_xls_to_xlsx(self, xls_path: Path) -> Path:
         """Read legacy .xls via xlrd and write out a .xlsx copy next to it."""

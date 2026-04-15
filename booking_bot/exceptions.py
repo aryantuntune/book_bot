@@ -43,3 +43,10 @@ class ChromeNotInstalledError(FatalError):
     """The shareable .exe tried to launch via channel="chrome" but the target
     machine has no Google Chrome install. Carries a human-readable install
     link that the GUI bootstrap shows directly to the operator."""
+
+
+class ProfileInUseError(FatalError):
+    """The Chromium user-data dir for this --profile-suffix is already owned
+    by another live booking_bot instance (Chromium enforces single-writer on
+    its profile). Surfaced as a loud, actionable error instead of the cryptic
+    Playwright TargetClosedError that otherwise trips the auto-restart loop."""

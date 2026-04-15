@@ -4,6 +4,7 @@ every record so the operator can tail the log in a second terminal."""
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -25,7 +26,11 @@ def setup_logging(debug: bool = False) -> Path:
     path so cli.main() can print it at startup."""
     config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_path = config.LOGS_DIR / f"booking_bot_{ts}.log"
+    # Include PID so two instances launched inside the same wall-clock second
+    # (e.g. two terminals with --profile-suffix) don't share the same log
+    # file and interleave their records. Single-instance runs are unaffected —
+    # PID is still unique.
+    log_path = config.LOGS_DIR / f"booking_bot_{ts}_pid{os.getpid()}.log"
 
     root = logging.getLogger()
     root.setLevel(logging.DEBUG if debug else logging.INFO)
