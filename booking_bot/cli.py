@@ -21,7 +21,15 @@ from pathlib import Path
 from booking_bot import browser, chat, config, playbook as playbook_mod
 from booking_bot.auth import full_auth, login_if_needed
 from booking_bot.excel import ExcelStore
+from booking_bot.ai_advisor import (
+    AdvisorBudget,
+    IncidentStore,
+    apply_advisor_decision,
+    build_snapshot,
+    consult,
+)
 from booking_bot.exceptions import (
+    AdvisorSkipRow,
     ChatStuckError,
     FatalError,
     GatewayError,
@@ -1209,6 +1217,93 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
         _shutdown_browser_shielded(ctx, browser_obj, pw)
 
 
+# Session-scoped advisor state. Initialized lazily on first use so the
+# bot never touches the Anthropic SDK unless it actually needs to.
+_advisor_budget: AdvisorBudget | None = None
+_advisor_store: IncidentStore | None = None
+
+
+def _get_advisor_state():
+    global _advisor_budget, _advisor_store
+    if _advisor_budget is None:
+        _advisor_budget = AdvisorBudget()
+    if _advisor_store is None:
+        _advisor_store = IncidentStore(config.ADVISOR_INCIDENTS_PATH)
+    return _advisor_budget, _advisor_store
+
+
+def _try_advisor_fallback(frame, page, pb, current_row_idx: int | None) -> str:
+    """Called from _recover_with_playbook after deterministic recovery
+    has raised. Returns one of:
+      - "acted":    advisor picked an action (click/reload) and the
+                    bot should continue with the returned frame.
+      - "declined": advisor refused or returned None; caller should
+                    fall back to the existing replay_auth path.
+    On skip_row the AdvisorSkipRow exception propagates out to the
+    row loop — this function never returns "skip_row".
+    """
+    if not config.ADVISOR_ENABLED:
+        return "declined"
+    budget, store = _get_advisor_state()
+
+    try:
+        current_state = chat.detect_state(frame)
+    except Exception as e:
+        log.warning(f"advisor fallback: detect_state failed ({e}); declining")
+        return "declined"
+
+    row_hint = None
+    if current_row_idx is not None:
+        row_hint = f"row {current_row_idx}"
+    snapshot = build_snapshot(
+        frame,
+        state=current_state,
+        recent_actions=[],
+        row_hint=row_hint,
+    )
+
+    pre_state = snapshot.state
+    pre_buttons = snapshot.enabled_buttons
+
+    decision = consult(snapshot, store, budget, client=None)
+    if decision is None:
+        return "declined"
+
+    outcome = apply_advisor_decision(decision, frame, page, budget=budget)
+
+    if outcome != "acted":
+        return "declined"
+
+    try:
+        chat.wait_until_settled(frame)
+    except Exception as e:
+        log.warning(f"advisor fallback: wait_until_settled failed ({e})")
+        return "declined"
+
+    try:
+        new_state = chat.detect_state(frame)
+    except Exception as e:
+        log.warning(f"advisor fallback: post-action detect_state failed ({e})")
+        return "declined"
+
+    if new_state != pre_state and new_state != "UNKNOWN":
+        try:
+            store.record_success(
+                snapshot,
+                decision,
+                recovered_to=new_state,
+            )
+            log.info(
+                f"advisor fallback: recorded success for "
+                f"state={pre_state!r} buttons={list(pre_buttons)!r} "
+                f"-> {new_state!r}"
+            )
+        except Exception as e:
+            log.warning(f"advisor fallback: record_success failed ({e})")
+
+    return "acted"
+
+
 def _recover_with_playbook(page, pb, operator_phone, get_otp):
     """Playbook-aware recovery: gateway-aware, reload only as a last resort.
 
@@ -1321,14 +1416,18 @@ def _recover_with_playbook(page, pb, operator_phone, get_otp):
     try:
         playbook_mod.reset_to_customer_entry(frame, pb)
     except (OptionNotFoundError, ChatStuckError, GatewayError) as e:
-        # reset couldn't find a usable nav target — fall back to the legacy
-        # replay_auth path (blindly clicks Booking Services → Book for Others)
-        # so we still have a chance of landing on phone entry for sessions
-        # that came up fresh on the main menu.
         log.warning(
-            f"reset after reload failed ({type(e).__name__}: {e}); "
-            f"falling back to replay_auth"
+            f"reset after reload failed ({type(e).__name__}: {e})"
         )
+        # Advisor fallback: when deterministic recovery has genuinely
+        # exhausted, consult the AI advisor. On decline we fall through
+        # to the existing replay_auth path.
+        advisor_handled = _try_advisor_fallback(
+            frame, page, pb, current_row_idx=None,
+        )
+        if advisor_handled == "acted":
+            return frame
+        log.warning("advisor declined; falling back to replay_auth")
         playbook_mod.replay_auth(frame, pb)
     return frame
 
