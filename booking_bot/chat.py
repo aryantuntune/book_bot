@@ -371,11 +371,23 @@ def _classify_state(button_labels: list[str], scroller_text: str) -> str:
     return "UNKNOWN"
 
 
+# Input-name classification for the empty-input heuristic. These lists are
+# the single source of truth for "which DOM input means which state" and
+# are consulted by _resolve_state. The operator sets are intentionally
+# broad and case-insensitive because getting them wrong has a real safety
+# cost: a missed operator-auth classification sends actual customer phone
+# numbers into HPCL's operator-phone field, triggering real OTP SMS to
+# those customers (prod incident 2026-04-15).
+_CUSTOMER_INPUT_NAMES = frozenset({"newmobile"})
+_OPERATOR_AUTH_INPUT_NAMES = frozenset({"mobile"})
+_OPERATOR_OTP_INPUT_NAMES = frozenset({"otp"})
+
+
 def _resolve_state(
     enabled_buttons: list[str],
     last_bubble_text: str,
     recent_text: str,
-    has_empty_input: bool,
+    empty_input_names: list[str],
 ) -> str:
     """Pure priority pipeline used by detect_state. Kept separate from the
     Frame-reading wrapper so we can unit-test the resolution rules with
@@ -386,7 +398,22 @@ def _resolve_state(
       2. Auth/OTP text in the LAST BUBBLE ONLY — never in scrollback,
          because stale auth bubbles from a prior cycle would otherwise
          re-trigger NEEDS_OPERATOR_AUTH after a healthy login.
-      3. Empty inline input → READY_FOR_CUSTOMER.
+      3. Empty inline input, BUT classified by its `name` attribute:
+           - 'mobile' (or any _OPERATOR_AUTH_INPUT_NAMES) -> NEEDS_OPERATOR_AUTH
+           - 'otp'    (or any _OPERATOR_OTP_INPUT_NAMES)  -> NEEDS_OPERATOR_OTP
+           - 'newmobile' (or any _CUSTOMER_INPUT_NAMES)   -> READY_FOR_CUSTOMER
+           - Unknown name -> fall through to (4) instead of assuming
+             READY_FOR_CUSTOMER. This is the hard invariant: we NEVER
+             report READY_FOR_CUSTOMER unless the empty input is a
+             KNOWN customer-phone field. Prior behavior assumed any
+             empty input meant customer-phone, and after a reload onto
+             HPCL's operator-auth screen the bot typed real customer
+             numbers into the operator field, triggering SMS to those
+             customers (fixed 2026-04-15).
+         When BOTH a customer input and an operator input are visible
+         (rare; transient double-render), the operator-auth classification
+         wins — typing customer data into an operator field is the
+         failure we're optimizing against.
       4. Last-resort recent-text classifier."""
     if enabled_buttons:
         button_state = _classify_state(enabled_buttons, "")
@@ -398,7 +425,12 @@ def _resolve_state(
             if p.search(last_bubble_text or ""):
                 return state_name
 
-    if has_empty_input:
+    input_names_lower = {(n or "").strip().lower() for n in empty_input_names}
+    if input_names_lower & _OPERATOR_AUTH_INPUT_NAMES:
+        return "NEEDS_OPERATOR_AUTH"
+    if input_names_lower & _OPERATOR_OTP_INPUT_NAMES:
+        return "NEEDS_OPERATOR_OTP"
+    if input_names_lower & _CUSTOMER_INPUT_NAMES:
         return "READY_FOR_CUSTOMER"
 
     return _classify_state([], recent_text)
@@ -468,6 +500,13 @@ def detect_state(frame: Frame) -> str:
                 if (el.value && el.value.trim().length > 0) return false;
                 return true;
               }});
+              // Collect the `name` (or `id` as fallback) of every empty
+              // input. _resolve_state uses these to tell customer-phone
+              // inputs (newmobile) apart from operator-auth inputs
+              // (mobile, otp) — a mix-up here sends real SMS to customers.
+              const emptyInputNames = inputs.map(el =>
+                (el.getAttribute('name') || el.id || '').trim()
+              ).filter(n => n.length > 0);
               const s = document.querySelector('{config.SEL_SCROLLER}');
               // Build TWO views of the recent scroller text:
               //  - lastBubbleText: ONLY the very last non-empty bubble. Used
@@ -503,7 +542,7 @@ def detect_state(frame: Frame) -> str:
                 buttons: btns,
                 text: recentText,
                 lastBubbleText: lastBubbleText,
-                hasEmptyInput: inputs.length > 0,
+                emptyInputNames: emptyInputNames,
               }};
             }}
             """
@@ -515,7 +554,7 @@ def detect_state(frame: Frame) -> str:
         enabled_buttons=data["buttons"],
         last_bubble_text=data.get("lastBubbleText") or "",
         recent_text=data["text"],
-        has_empty_input=bool(data.get("hasEmptyInput")),
+        empty_input_names=list(data.get("emptyInputNames") or []),
     )
 
 

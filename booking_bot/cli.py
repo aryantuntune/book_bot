@@ -1055,6 +1055,27 @@ def _recover_with_playbook(page, pb, operator_phone, get_otp):
                 frame = page.main_frame
                 state = chat.detect_state(frame)
                 last_state = state
+                # Fast-path operator-auth/OTP states: reset_to_customer_entry
+                # cannot possibly recover from these (no nav buttons exist on
+                # the operator-phone or OTP screen), so polling is wasted
+                # time. Break out of the in-place loop and go straight to
+                # the reload+login_if_needed path which has the cooldown
+                # logic that prevents typing into the operator field.
+                # CRITICAL: without this fast-path, the prior code would
+                # leave the bot in detect_state's NEEDS_OPERATOR_AUTH state
+                # for IN_PLACE_POLL_S seconds, and any concurrent row
+                # processing happening in the background could keep
+                # typing customer phones into the operator field — that
+                # is the prod incident this whole fix is about.
+                if state in ("NEEDS_OPERATOR_AUTH", "NEEDS_OPERATOR_OTP"):
+                    log.warning(
+                        f"playbook recover: in-place state={state!r} — "
+                        f"operator auth surface visible. Skipping in-place "
+                        f"reset (no nav buttons exist on this screen) and "
+                        f"going straight to reload+login_if_needed which "
+                        f"will honor the auth cooldown."
+                    )
+                    break
                 if state != "UNKNOWN":
                     log.info(
                         f"playbook recover: in-place state={state!r}; "

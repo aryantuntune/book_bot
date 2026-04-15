@@ -45,7 +45,7 @@ def test_resolve_stale_auth_text_in_scrollback_does_not_trigger_auth():
             "OTP sent to your registered mobile\n"
             "Please enter customer's 10 digit mobile number"
         ),
-        has_empty_input=True,
+        empty_input_names=["newmobile"],
     )
     assert state == "READY_FOR_CUSTOMER"
 
@@ -60,7 +60,7 @@ def test_resolve_stale_otp_text_in_scrollback_does_not_trigger_otp():
             "OTP sent to your registered mobile\n"
             "please enter customer mobile"
         ),
-        has_empty_input=True,
+        empty_input_names=["newmobile"],
     )
     assert state == "READY_FOR_CUSTOMER"
 
@@ -72,7 +72,7 @@ def test_resolve_real_auth_state_still_detected():
         enabled_buttons=[],
         last_bubble_text="Please enter your 10 digit mobile number",
         recent_text="Please enter your 10 digit mobile number",
-        has_empty_input=True,
+        empty_input_names=["mobile"],
     )
     assert state == "NEEDS_OPERATOR_AUTH"
 
@@ -82,7 +82,7 @@ def test_resolve_real_otp_state_still_detected():
         enabled_buttons=[],
         last_bubble_text="OTP sent to your registered mobile, please enter otp",
         recent_text="OTP sent to your registered mobile, please enter otp",
-        has_empty_input=True,
+        empty_input_names=["otp"],
     )
     assert state == "NEEDS_OPERATOR_OTP"
 
@@ -93,19 +93,19 @@ def test_resolve_buttons_take_top_priority():
         enabled_buttons=["Book for Others", "Book for Self"],
         last_bubble_text="Please enter your 10 digit mobile number",
         recent_text="anything",
-        has_empty_input=True,
+        empty_input_names=["newmobile"],
     )
     assert state == "BOOK_FOR_OTHERS_MENU"
 
 
-def test_resolve_empty_input_falls_back_to_ready_for_customer():
-    """When no buttons match and no auth text in latest bubble, an empty
-    input means HPCL is waiting for the customer phone."""
+def test_resolve_customer_input_present_falls_back_to_ready_for_customer():
+    """When no buttons match and no auth text in latest bubble, a
+    'newmobile' input means HPCL is waiting for the customer phone."""
     state = _resolve_state(
         enabled_buttons=[],
         last_bubble_text="something else entirely",
         recent_text="",
-        has_empty_input=True,
+        empty_input_names=["newmobile"],
     )
     assert state == "READY_FOR_CUSTOMER"
 
@@ -115,6 +115,107 @@ def test_resolve_unknown_when_nothing_matches():
         enabled_buttons=[],
         last_bubble_text="totally unrelated bubble",
         recent_text="totally unrelated bubble",
-        has_empty_input=False,
+        empty_input_names=[],
     )
     assert state == "UNKNOWN"
+
+
+# ---- CRITICAL: operator-auth input must never be misclassified as
+# READY_FOR_CUSTOMER. Prior bug: after a reload that landed on HPCL's
+# operator-phone-entry screen, detect_state saw an empty input and
+# returned READY_FOR_CUSTOMER without checking WHICH input it was.
+# The bot then typed actual customer phone numbers into the operator
+# auth field, triggering real OTP SMS to those customers. ----
+
+def test_resolve_operator_mobile_input_is_needs_operator_auth():
+    """An empty 'mobile' input (HPCL's operator phone entry field) must
+    be classified as NEEDS_OPERATOR_AUTH even when the last bubble text
+    is silent on auth — the presence of the input itself is the signal."""
+    state = _resolve_state(
+        enabled_buttons=[],
+        last_bubble_text="",
+        recent_text="",
+        empty_input_names=["mobile"],
+    )
+    assert state == "NEEDS_OPERATOR_AUTH"
+
+
+def test_resolve_operator_mobile_input_wins_over_silent_last_bubble():
+    """Even with a menu-like recent_text in scrollback, an empty 'mobile'
+    input still classifies as NEEDS_OPERATOR_AUTH. The bot must NOT type
+    customer phones into this field."""
+    state = _resolve_state(
+        enabled_buttons=[],
+        last_bubble_text="",
+        recent_text="book for others\nsome menu\n",
+        empty_input_names=["mobile"],
+    )
+    assert state == "NEEDS_OPERATOR_AUTH"
+
+
+def test_resolve_otp_input_is_needs_operator_otp():
+    """An empty 'otp' input (HPCL's OTP entry field) must be classified
+    as NEEDS_OPERATOR_OTP — never READY_FOR_CUSTOMER."""
+    state = _resolve_state(
+        enabled_buttons=[],
+        last_bubble_text="",
+        recent_text="",
+        empty_input_names=["otp"],
+    )
+    assert state == "NEEDS_OPERATOR_OTP"
+
+
+def test_resolve_unknown_input_name_does_not_claim_ready_for_customer():
+    """If the empty input has an UNKNOWN name (neither newmobile nor
+    mobile/otp), we must NOT return READY_FOR_CUSTOMER — fall through to
+    text classification or UNKNOWN. Typing a customer phone into an
+    unknown field is the exact bug this prevents."""
+    state = _resolve_state(
+        enabled_buttons=[],
+        last_bubble_text="totally unrelated",
+        recent_text="totally unrelated",
+        empty_input_names=["some_new_hpcl_field"],
+    )
+    assert state == "UNKNOWN"
+
+
+def test_resolve_mobile_input_beats_stale_customer_text_in_scrollback():
+    """After a reload onto the operator-auth screen, the scrollback
+    may still contain 'customer mobile' text from before the reload.
+    The empty 'mobile' input must still win — NEEDS_OPERATOR_AUTH."""
+    state = _resolve_state(
+        enabled_buttons=[],
+        last_bubble_text="Please enter your mobile number",
+        recent_text=(
+            "please enter the mobile number of the customer\n"
+            "Please enter your mobile number"
+        ),
+        empty_input_names=["mobile"],
+    )
+    assert state == "NEEDS_OPERATOR_AUTH"
+
+
+def test_resolve_customer_and_operator_inputs_both_present_prefers_operator():
+    """If HPCL momentarily renders both inputs (legacy + new), the
+    operator-auth input is the more dangerous one to ignore — always
+    classify as NEEDS_OPERATOR_AUTH so the bot refuses to type customer
+    data into the wrong field."""
+    state = _resolve_state(
+        enabled_buttons=[],
+        last_bubble_text="",
+        recent_text="",
+        empty_input_names=["newmobile", "mobile"],
+    )
+    assert state == "NEEDS_OPERATOR_AUTH"
+
+
+def test_resolve_case_insensitive_input_names():
+    """Input name matching must be case-insensitive — HPCL could ship
+    'Mobile' or 'MOBILE' in a future markup change."""
+    state = _resolve_state(
+        enabled_buttons=[],
+        last_bubble_text="",
+        recent_text="",
+        empty_input_names=["Mobile"],
+    )
+    assert state == "NEEDS_OPERATOR_AUTH"
