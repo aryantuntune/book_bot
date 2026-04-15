@@ -202,3 +202,20 @@ STATE_PATTERNS: dict[str, list[re.Pattern[str]]] = {
 # ---- Gateway error signatures ----
 GATEWAY_STATUS_CODES = {502, 503, 504}
 GATEWAY_URL_RE = re.compile(r"error|gateway|nginx", re.IGNORECASE)
+
+# ---- AI Recovery Advisor (see docs/superpowers/specs/2026-04-15-ai-advisor-design.md) ----
+# Kill switch. When False, the advisor fallback branch in
+# _recover_with_playbook is a no-op and the bot behaves exactly as current
+# main. Flip to False for emergency rollback without redeploying.
+ADVISOR_ENABLED               = True
+ADVISOR_MODEL                 = "claude-sonnet-4-6"
+ADVISOR_API_TIMEOUT_S         = 10.0
+# Hard caps. An AI that got confused cannot burn down the night: the
+# budget is capped and then the advisor goes silent for the rest of the
+# session, falling back to existing crash-and-restart semantics.
+ADVISOR_MAX_CALLS_PER_SESSION = 50
+ADVISOR_MAX_CONSECUTIVE_SKIPS = 3
+ADVISOR_MAX_TOTAL_SKIPS       = 15
+# Episodic memory store. Append-only JSONL, one incident per line,
+# hand-editable. Created on first use by IncidentStore.__init__ if missing.
+ADVISOR_INCIDENTS_PATH        = ROOT / "data" / "incidents.jsonl"

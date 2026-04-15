@@ -4,3 +4,4 @@ xlrd==1.2.0
 colorlog==6.8.2
 pytest==8.3.3
 rich==13.7.1
+anthropic>=0.40

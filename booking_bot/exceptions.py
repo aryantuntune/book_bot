@@ -45,6 +45,21 @@ class ChromeNotInstalledError(FatalError):
     link that the GUI bootstrap shows directly to the operator."""
 
 
+class AdvisorSkipRow(BookingBotError):
+    """Raised by the AI advisor dispatcher when the advisor judged the
+    current row as hopeless (e.g. payment pending, duplicate booking).
+    The row loop catches it, writes the row as ISSUE via
+    excel.write_issue, and advances the queue without any further
+    retry attempts. This is an intentional short-circuit — the AI
+    has explicitly said 'skip this one, don't retry.'
+
+    Carries the reason string for logging and audit."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
 class ProfileInUseError(FatalError):
     """The Chromium user-data dir for this --profile-suffix is already owned
     by another live booking_bot instance (Chromium enforces single-writer on
