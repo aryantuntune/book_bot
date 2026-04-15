@@ -21,6 +21,7 @@ from pathlib import Path
 from booking_bot import browser, chat, config, playbook as playbook_mod
 from booking_bot.auth import full_auth, login_if_needed
 from booking_bot.excel import ExcelStore
+from booking_bot.ai_advisor import SAFE_RECOVERED_STATES  # noqa: F401
 from booking_bot.ai_advisor import (
     AdvisorBudget,
     IncidentStore,
@@ -1067,10 +1068,13 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
                     raise
                 except AdvisorSkipRow as skip_e:
                     # The advisor explicitly judged this row hopeless
-                    # (e.g. payment pending). Lock as ISSUE and advance
-                    # without counting against the consecutive-failure
-                    # circuit breaker — this is an intentional single-
-                    # row drop, not a cascade.
+                    # (e.g. payment pending). Lock as ISSUE and advance.
+                    # A single skip is an intentional row drop, not a
+                    # cascade — but N consecutive skips is a cascade,
+                    # and the budget already caps both cases. If the
+                    # budget has now exhausted, escalate so the outer
+                    # loop restarts the browser and the advisor stops
+                    # being consulted for the rest of the session.
                     log.warning(
                         f"row {row_idx} ({phone}): advisor chose skip_row "
                         f"(reason={skip_e.reason!r}); locking as ISSUE and advancing"
@@ -1082,6 +1086,19 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
                     )
                     current_row_idx = None
                     current_phone = None
+                    budget_local, _ = _get_advisor_state()
+                    if budget_local.exhausted():
+                        raise RestartableFatalError(
+                            f"advisor skip cascade: budget exhausted "
+                            f"(consecutive_skips={budget_local.consecutive_skips}/"
+                            f"{budget_local.max_consecutive_skips} "
+                            f"total_skips={budget_local.total_skips}/"
+                            f"{budget_local.max_total_skips}). "
+                            f"The advisor has given up on too many rows in a row. "
+                            f"Triggering in-process browser restart — a fresh "
+                            f"relaunch lets deterministic recovery retry these "
+                            f"rows cleanly."
+                        )
                     continue
                 except Exception as row_e:
                     # Catch-all so a single row's unexpected failure never
@@ -1304,7 +1321,7 @@ def _try_advisor_fallback(frame, page, pb, current_row_idx: int | None) -> str:
         log.warning(f"advisor fallback: post-action detect_state failed ({e})")
         return "declined"
 
-    if new_state != pre_state and new_state != "UNKNOWN":
+    if new_state != pre_state and new_state in SAFE_RECOVERED_STATES:
         try:
             store.record_success(
                 snapshot,
@@ -1318,6 +1335,12 @@ def _try_advisor_fallback(frame, page, pb, current_row_idx: int | None) -> str:
             )
         except Exception as e:
             log.warning(f"advisor fallback: record_success failed ({e})")
+    elif new_state != pre_state:
+        log.warning(
+            f"advisor fallback: state changed {pre_state!r} -> {new_state!r} "
+            f"but target is not in SAFE_RECOVERED_STATES; refusing to "
+            f"memorize (would cache-poison the corpus)"
+        )
 
     return "acted"
 
