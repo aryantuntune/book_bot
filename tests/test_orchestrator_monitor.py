@@ -196,3 +196,62 @@ def test_run_monitor_once_filter_excludes_other_sources(tmp_path):
     text = monitor.render_once(runs_dir=tmp_path, source_filter="ASU")
     assert "ASU-001" in text
     assert "BPCL-001" not in text
+
+
+def _make_hb(chunk_id, *, phase="booking", slot="op1",
+             idle_secs=0.0, rows_done=0):
+    from datetime import datetime, timedelta, timezone
+    from booking_bot.orchestrator.heartbeat import Heartbeat
+    last = (datetime.now(tz=timezone.utc) - timedelta(seconds=idle_secs)).isoformat()
+    return Heartbeat(
+        source="T", chunk_id=chunk_id, pid=123,
+        input_file="in.xlsx", profile_suffix=chunk_id,
+        phase=phase, rows_total=10, rows_done=rows_done, rows_issue=0,
+        rows_pending=10 - rows_done, current_row_idx=None, current_phone=None,
+        started_at="2026-04-16T00:00:00+00:00",
+        last_activity_at=last,
+        command=["python"], exit_code=None, last_error=None,
+        operator_slot=slot,
+    )
+
+
+def test_build_table_shows_operator_slot_column():
+    from booking_bot.orchestrator.monitor import build_table
+    hbs = [_make_hb("T-001", slot="op1"), _make_hb("T-002", slot="op2")]
+    table = build_table(hbs)
+    headers = [c.header for c in table.columns]
+    assert "Op" in headers
+
+
+def test_build_operator_reauth_banner_flags_stuck_slot():
+    from booking_bot.orchestrator.monitor import build_operator_reauth_banner
+    hbs = [
+        _make_hb("T-001", slot="op1", phase="authenticating", idle_secs=300),
+        _make_hb("T-002", slot="op1", phase="authenticating", idle_secs=300),
+        _make_hb("T-003", slot="op1", phase="authenticating", idle_secs=300),
+        _make_hb("T-004", slot="op2", phase="booking", idle_secs=2),
+    ]
+    banner = build_operator_reauth_banner(hbs)
+    assert "op1" in banner
+    assert "3 chunks" in banner
+    assert "op2" not in banner
+
+
+def test_build_operator_reauth_banner_empty_when_all_healthy():
+    from booking_bot.orchestrator.monitor import build_operator_reauth_banner
+    hbs = [
+        _make_hb("T-001", slot="op1", phase="booking", idle_secs=0),
+        _make_hb("T-002", slot="op2", phase="booking", idle_secs=0),
+    ]
+    assert build_operator_reauth_banner(hbs) == ""
+
+
+def test_build_operator_reauth_banner_ignores_single_stuck_chunk():
+    """One stuck chunk in a slot isn't an operator-wide problem — don't
+    cry wolf."""
+    from booking_bot.orchestrator.monitor import build_operator_reauth_banner
+    hbs = [
+        _make_hb("T-001", slot="op1", phase="authenticating", idle_secs=300),
+        _make_hb("T-002", slot="op1", phase="booking", idle_secs=0),
+    ]
+    assert build_operator_reauth_banner(hbs) == ""

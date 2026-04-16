@@ -63,6 +63,7 @@ def build_table(hbs: Iterable[Heartbeat]) -> Table:
     """Render a rich.Table for the monitor view. Pure — no I/O, no state."""
     table = Table(title="Orchestrator — chunk status", expand=True)
     table.add_column("Chunk", no_wrap=True)
+    table.add_column("Op", no_wrap=True)
     table.add_column("PID", justify="right")
     table.add_column("Phase")
     table.add_column("Done", justify="right")
@@ -80,6 +81,7 @@ def build_table(hbs: Iterable[Heartbeat]) -> Table:
             idle_cell = f"[yellow]{idle_cell}[/yellow]"
         table.add_row(
             hb.chunk_id,
+            hb.operator_slot or "-",
             str(hb.pid if hb.pid > 0 else "-"),
             phase_cell,
             str(hb.rows_done),
@@ -89,6 +91,39 @@ def build_table(hbs: Iterable[Heartbeat]) -> Table:
             idle_cell,
         )
     return table
+
+
+def build_operator_reauth_banner(hbs: Iterable[Heartbeat]) -> str:
+    """Return a single high-visibility warning line if >=2 chunks belonging
+    to the same operator_slot are stuck in an auth-pending state for
+    more than 60s. Returns '' when nothing is stuck — callers can check
+    truthiness to decide whether to render.
+
+    The detection heuristic: phase=='authenticating' and idle > 60s. This
+    is the exact shape of the cooldown_wait quiet-retry loop when HPCL
+    has killed the operator's sessions server-side; the operator's
+    correct response is to re-auth *that* slot and let shared_auth
+    propagate."""
+    by_slot: dict[str, int] = {}
+    for hb in hbs:
+        if hb.operator_slot is None:
+            continue
+        if hb.phase != "authenticating":
+            continue
+        if _idle_seconds(hb) <= 60:
+            continue
+        by_slot[hb.operator_slot] = by_slot.get(hb.operator_slot, 0) + 1
+    stuck_slots = sorted(
+        (slot for slot, n in by_slot.items() if n >= 2)
+    )
+    if not stuck_slots:
+        return ""
+    parts = []
+    for slot in stuck_slots:
+        parts.append(
+            f"operator {slot} NEEDS RE-AUTH ({by_slot[slot]} chunks waiting)"
+        )
+    return "!! " + " | ".join(parts) + " !!"
 
 
 def build_totals_line(hbs: Iterable[Heartbeat]) -> str:
@@ -239,8 +274,9 @@ import threading
 import time
 from pathlib import Path
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
+from rich.text import Text
 
 from booking_bot import config
 from booking_bot.orchestrator import heartbeat as _heartbeat
@@ -251,6 +287,9 @@ def render_once(*, runs_dir: Path, source_filter: str | None) -> str:
     Used by tests and by the one-shot `orchestrator status` command."""
     hbs = _heartbeat.read_all(runs_dir, source=source_filter)
     console = Console(record=True, width=160)
+    banner = build_operator_reauth_banner(hbs)
+    if banner:
+        console.print(Text(banner, style="bold red"))
     console.print(build_table(hbs))
     console.print(build_totals_line(hbs))
     return console.export_text()
@@ -293,7 +332,15 @@ def run_monitor(
                   refresh_per_second=refresh_hz, screen=False) as live:
             while not stop_evt.is_set():
                 hbs = _heartbeat.read_all(runs, source=source_filter)
-                live.update(build_table(hbs))
+                banner = build_operator_reauth_banner(hbs)
+                if banner:
+                    renderable = Group(
+                        Text(banner, style="bold red"),
+                        build_table(hbs),
+                    )
+                else:
+                    renderable = build_table(hbs)
+                live.update(renderable)
                 _handle_stall_detection(hbs, budget, runs)
                 _drain_commands(cmd_queue, stop_evt, runs, source_filter)
                 time.sleep(1.0 / max(refresh_hz, 0.5))
