@@ -81,6 +81,7 @@ def _initial_heartbeat(spec: ChunkSpec, cmd: list[str]) -> heartbeat.Heartbeat:
         command=cmd,
         exit_code=None,
         last_error=None,
+        operator_slot=spec.operator_slot,
     )
 
 

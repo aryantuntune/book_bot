@@ -73,3 +73,33 @@ def test_write_heartbeat_disjoint_bucket_invariant(tmp_path, monkeypatch):
     assert data["rows_issue"] == 2
     assert data["rows_pending"] == 5
     assert data["rows_done"] + data["rows_issue"] + data["rows_pending"] == data["rows_total"]
+
+
+def test_write_heartbeat_includes_operator_slot(tmp_path, monkeypatch):
+    """operator_slot is read from BOOKING_BOT_OPERATOR_SLOT and stored in heartbeat."""
+    hb_path = tmp_path / "runs" / "TEST" / "TEST-002.heartbeat.json"
+    monkeypatch.setenv("BOOKING_BOT_HEARTBEAT_PATH", str(hb_path))
+    monkeypatch.setenv("BOOKING_BOT_SOURCE", "TEST")
+    monkeypatch.setenv("BOOKING_BOT_CHUNK_ID", "TEST-002")
+    monkeypatch.setenv("BOOKING_BOT_OPERATOR_SLOT", "op3")
+    monkeypatch.setattr(cli, "_heartbeat_started_at", None, raising=False)
+
+    store = _fake_store({
+        "total": 5, "done": 2, "pending": 3, "issue": 0,
+        "success": 2, "ekyc": 0, "not_registered": 0, "payment_pending": 0,
+    })
+    cli._write_heartbeat("booking", store)
+    data = json.loads(hb_path.read_text(encoding="utf-8"))
+    assert data["operator_slot"] == "op3"
+
+
+def test_operator_slot_from_env_returns_none_when_unset(monkeypatch):
+    """Helper returns None when env var is absent."""
+    monkeypatch.delenv("BOOKING_BOT_OPERATOR_SLOT", raising=False)
+    assert cli._operator_slot_from_env() is None
+
+
+def test_operator_slot_from_env_returns_value(monkeypatch):
+    """Helper returns the env value when set."""
+    monkeypatch.setenv("BOOKING_BOT_OPERATOR_SLOT", "op3")
+    assert cli._operator_slot_from_env() == "op3"

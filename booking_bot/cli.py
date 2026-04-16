@@ -100,6 +100,11 @@ _PROFILE_SUFFIX: str | None = None
 _heartbeat_started_at: str | None = None
 
 
+def _operator_slot_from_env() -> str | None:
+    """Return BOOKING_BOT_OPERATOR_SLOT from the environment, or None."""
+    return os.environ.get("BOOKING_BOT_OPERATOR_SLOT") or None
+
+
 def _write_heartbeat(
     phase: str,
     store,
@@ -158,6 +163,7 @@ def _write_heartbeat(
         command=list(sys.argv),
         exit_code=None,
         last_error=last_error,
+        operator_slot=_operator_slot_from_env(),
     )
     _hb.write(_Path(path_str), hb)
 

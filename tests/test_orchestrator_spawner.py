@@ -127,6 +127,32 @@ def test_spawn_chunk_sets_operator_env_vars(spawner_env, monkeypatch):
     assert "BOOKING_BOT_OPERATOR_PHONE=9222222222" in text
 
 
+def test_spawn_chunk_writes_pending_heartbeat_with_operator_slot(spawner_env, monkeypatch):
+    """Pending heartbeat written before child runs must carry operator_slot."""
+    from booking_bot.orchestrator import heartbeat as hb_mod
+
+    monkeypatch.setenv("BOOKING_BOT_SPAWNER_CMD_OVERRIDE", f"{sys.executable}|{FAKE_BOT}")
+    (spawner_env / "fake.xlsx").write_text("")
+    spec = ChunkSpec(
+        source="FAKE",
+        chunk_id="FAKE-005",
+        chunk_index=5,
+        input_path=spawner_env / "fake.xlsx",
+        profile_suffix="FAKE-005",
+        heartbeat_path=spawner_env / "runs" / "FAKE" / "FAKE-005.heartbeat.json",
+        row_count=3,
+        operator_slot="op2",
+        operator_phone="9222222222",
+    )
+    handle = spawner.spawn_chunk(spec, headed=False)
+    try:
+        # Heartbeat is written synchronously before Popen — no need to wait.
+        hb = hb_mod.read(spec.heartbeat_path)
+        assert hb.operator_slot == "op2"
+    finally:
+        handle.popen.wait(timeout=10)
+
+
 def test_kill_chunk_terminates_a_long_running_child(spawner_env, monkeypatch):
     slow_script = spawner_env / "slow.py"
     slow_script.write_text("import time; time.sleep(30)\n")
