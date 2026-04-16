@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from booking_bot import config
+from booking_bot import config, exceptions
 from booking_bot.orchestrator import auth_template, heartbeat, monitor, spawner, splitter
 
 log = logging.getLogger("orchestrator.cli")
@@ -37,6 +37,34 @@ def _parse_operator_phones(raw: str) -> list[str]:
     if len(set(parts)) != len(parts):
         raise argparse.ArgumentTypeError("duplicate operator phone in list")
     return parts
+
+
+def _verify_operator_seeds(
+    source: str, operator_phones: list[str],
+) -> None:
+    """For each operator slot, check that the seed exists, is fresh, and
+    has a seed_phone.json that matches the passed phone. Raises
+    exceptions.AuthSeedMissing with a list of failing slots."""
+    max_age_s = float(
+        config.AUTH_COOLDOWN_S - config.ORCHESTRATOR_AUTH_SEED_BUFFER_S
+    )
+    missing: list[str] = []
+    for i, phone in enumerate(operator_phones):
+        slot = f"op{i + 1}"
+        seed = auth_template._seed_path(source, slot)
+        if not seed.exists():
+            missing.append(f"{slot} (no seed dir)")
+            continue
+        if not auth_template._auth_fresh(seed, max_age_s=max_age_s):
+            missing.append(f"{slot} (seed stale or unparseable)")
+            continue
+        recorded = auth_template._read_seed_phone(source, slot)
+        if recorded != phone:
+            missing.append(
+                f"{slot} (mismatch: seeded for {recorded}, passed {phone})"
+            )
+    if missing:
+        raise exceptions.AuthSeedMissing(missing)
 
 
 # ---- Internal seams (monkey-patched by tests) ----
@@ -68,6 +96,16 @@ def build_parser() -> argparse.ArgumentParser:
     parallel = start.add_mutually_exclusive_group()
     parallel.add_argument("--chunk-size", type=int, default=None)
     parallel.add_argument("--instances",  type=int, default=None)
+    start.add_argument(
+        "--operator-phones", type=_parse_operator_phones, default=None,
+        help="comma-separated HPCL operator phones; enables multi-operator "
+             "mode. Total parallelism = len(phones) * --clones-per-operator. "
+             "When set, --chunk-size/--instances are ignored.",
+    )
+    start.add_argument(
+        "--clones-per-operator", type=int, default=3,
+        help="cloned bot instances per operator phone (1-3, default 3)",
+    )
     visibility = start.add_mutually_exclusive_group()
     visibility.add_argument("--headed", action="store_true")
     visibility.add_argument("--headless", dest="headed", action="store_false")
@@ -146,23 +184,41 @@ def run_start(
     input_file: Path,
     chunk_size: int | None,
     num_chunks: int | None,
+    operator_phones: list[str] | None = None,
+    clones_per_operator: int = 3,
     headed: bool,
     no_monitor: bool,
 ) -> int:
-    """Top-level start handler. Lock → split → auth seed → clone →
+    """Top-level start handler. Lock → split → auth seed verify → clone →
     spawn. Returns a shell exit code."""
-    if chunk_size is None and num_chunks is None:
-        chunk_size = 500  # default
+    if operator_phones is None and chunk_size is None and num_chunks is None:
+        chunk_size = 500  # preserve existing default
 
     lock_path = _acquire_lock(source)
     try:
-        chunks = splitter.split(
-            source, input_file,
-            chunk_size=chunk_size, num_chunks=num_chunks,
-        )
-        print(f"[orchestrator] split into {len(chunks)} chunks", flush=True)
+        if operator_phones is not None:
+            _verify_operator_seeds(source, operator_phones)
+            chunks = splitter.split(
+                source, input_file,
+                operator_phones=operator_phones,
+                clones_per_operator=clones_per_operator,
+            )
+            print(
+                f"[orchestrator] multi-operator split into {len(chunks)} "
+                f"chunks across {len(operator_phones)} operators "
+                f"({clones_per_operator} per operator)",
+                flush=True,
+            )
+        else:
+            chunks = splitter.split(
+                source, input_file,
+                chunk_size=chunk_size, num_chunks=num_chunks,
+            )
+            print(
+                f"[orchestrator] split into {len(chunks)} chunks", flush=True,
+            )
+            _ensure_auth_seed(source)
 
-        _ensure_auth_seed(source)
         _clone_to_chunks(source, chunks)
 
         handles = []
@@ -186,6 +242,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_start(
             source=args.source, input_file=args.input,
             chunk_size=args.chunk_size, num_chunks=args.instances,
+            operator_phones=args.operator_phones,
+            clones_per_operator=args.clones_per_operator,
             headed=args.headed, no_monitor=args.no_monitor,
         )
     if args.command == "auth":

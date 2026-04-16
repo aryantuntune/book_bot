@@ -83,3 +83,17 @@ class AuthCloneFailed(BookingBotError):
         self.failures = failures
         summary = ", ".join(f"{cid}: {err}" for cid, err in failures)
         super().__init__(f"profile clone failed for {len(failures)} chunks: {summary}")
+
+
+class AuthSeedMissing(BookingBotError):
+    """orchestrator/cli.py: start-time verification found that one or
+    more operator slots' auth seeds are missing, stale, or seeded with
+    a different operator phone than the one passed to --operator-phones.
+    Caller prints the list and exits; operator must rerun `orchestrator
+    auth` before retrying."""
+
+    def __init__(self, missing: list[str]) -> None:
+        self.missing = missing
+        super().__init__(
+            f"auth seeds missing or mismatched for: {', '.join(missing)}"
+        )

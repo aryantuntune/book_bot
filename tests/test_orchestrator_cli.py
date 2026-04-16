@@ -159,3 +159,146 @@ def test_auth_subcommand_legacy_singular_phone_rejects_unicode_digits(monkeypatc
             "auth", "--source", "T",
             "--operator-phone", "९111111111",  # leading Devanagari 9
         ])
+
+
+def test_start_subcommand_multi_operator_plumbs_phones_to_splitter(
+    tmp_path, monkeypatch,
+):
+    """start --operator-phones p1,p2,p3 --clones-per-operator 3 calls
+    splitter.split with those args and then clone_to_chunks, then
+    spawn_chunk."""
+    from booking_bot.orchestrator import cli, splitter, auth_template, spawner
+    from booking_bot.orchestrator.splitter import ChunkSpec
+    from booking_bot import config
+
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "RUNS_DIR", tmp_path / "data" / "runs")
+    monkeypatch.setattr(config, "CHUNKS_DIR", tmp_path / "Input" / "chunks")
+
+    from datetime import datetime, timezone
+    for slot, phone in (
+        ("op1", "9111111111"),
+        ("op2", "9222222222"),
+        ("op3", "9333333333"),
+    ):
+        seed = tmp_path / f".chromium-profile-MULTI-{slot}-auth-seed"
+        seed.mkdir(parents=True)
+        (seed / "last_auth.json").write_text(
+            '{"auth_at_utc": "' + datetime.now(timezone.utc).isoformat() + '"}',
+            encoding="utf-8",
+        )
+        (seed / "seed_phone.json").write_text(
+            '{"operator_phone": "' + phone + '"}',
+            encoding="utf-8",
+        )
+
+    split_calls = {}
+
+    def fake_split(source, input_file, **kwargs):
+        split_calls["source"] = source
+        split_calls["kwargs"] = kwargs
+        return [
+            ChunkSpec(
+                source=source, chunk_id=f"{source}-{i:03d}", chunk_index=i,
+                input_path=tmp_path / f"{i}.xlsx",
+                profile_suffix=f"{source}-{i:03d}",
+                heartbeat_path=tmp_path / f"{i}.heartbeat.json",
+                row_count=3,
+                operator_slot=f"op{((i - 1) // 3) + 1}",
+                operator_phone=kwargs["operator_phones"][((i - 1) // 3)],
+            )
+            for i in range(1, 10)
+        ]
+
+    clone_calls = []
+
+    def fake_clone(source, chunks):
+        clone_calls.append((source, chunks))
+
+    spawn_calls = []
+
+    class FakeHandle:
+        def __init__(self):
+            self.popen = None
+
+    def fake_spawn(spec, *, headed):
+        spawn_calls.append(spec)
+        return FakeHandle()
+
+    monkeypatch.setattr(splitter, "split", fake_split)
+    monkeypatch.setattr(auth_template, "clone_to_chunks", fake_clone)
+    monkeypatch.setattr(spawner, "spawn_chunk", fake_spawn)
+    monkeypatch.setattr(cli, "_spawn_chunk", fake_spawn)
+
+    inp = tmp_path / "file.xlsx"
+    inp.write_text("fake")
+
+    rc = cli.main([
+        "start", "--source", "MULTI", "--input", str(inp),
+        "--operator-phones", "9111111111,9222222222,9333333333",
+        "--clones-per-operator", "3",
+        "--no-monitor",
+    ])
+    assert rc == 0
+    assert split_calls["kwargs"]["operator_phones"] == [
+        "9111111111", "9222222222", "9333333333",
+    ]
+    assert split_calls["kwargs"]["clones_per_operator"] == 3
+    assert len(spawn_calls) == 9
+    assert len(clone_calls) == 1
+
+
+def test_start_subcommand_fails_when_seed_missing(tmp_path, monkeypatch):
+    from booking_bot.orchestrator import cli
+    from booking_bot import config, exceptions
+
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "RUNS_DIR", tmp_path / "data" / "runs")
+    monkeypatch.setattr(config, "CHUNKS_DIR", tmp_path / "Input" / "chunks")
+
+    inp = tmp_path / "file.xlsx"
+    inp.write_text("fake")
+
+    with pytest.raises(exceptions.AuthSeedMissing):
+        cli.main([
+            "start", "--source", "NOSEED", "--input", str(inp),
+            "--operator-phones", "9111111111,9222222222",
+            "--clones-per-operator", "3",
+            "--no-monitor",
+        ])
+
+
+def test_start_subcommand_fails_when_seed_phone_mismatches(
+    tmp_path, monkeypatch,
+):
+    """If operator passes phones in a different order than auth was run,
+    the seed_phone.json sidecars no longer match → loud error."""
+    from booking_bot.orchestrator import cli
+    from booking_bot import config, exceptions
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "RUNS_DIR", tmp_path / "data" / "runs")
+    monkeypatch.setattr(config, "CHUNKS_DIR", tmp_path / "Input" / "chunks")
+
+    for slot, phone in (("op1", "9111111111"), ("op2", "9222222222")):
+        seed = tmp_path / f".chromium-profile-MULTI-{slot}-auth-seed"
+        seed.mkdir(parents=True)
+        (seed / "last_auth.json").write_text(
+            '{"auth_at_utc": "' + datetime.now(timezone.utc).isoformat() + '"}',
+            encoding="utf-8",
+        )
+        (seed / "seed_phone.json").write_text(
+            '{"operator_phone": "' + phone + '"}', encoding="utf-8",
+        )
+
+    inp = tmp_path / "file.xlsx"
+    inp.write_text("fake")
+
+    with pytest.raises(exceptions.AuthSeedMissing, match="mismatch"):
+        cli.main([
+            "start", "--source", "MULTI", "--input", str(inp),
+            "--operator-phones", "9222222222,9111111111",
+            "--clones-per-operator", "1",
+            "--no-monitor",
+        ])
