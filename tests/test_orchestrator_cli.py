@@ -248,9 +248,9 @@ def test_start_subcommand_multi_operator_plumbs_phones_to_splitter(
     assert len(clone_calls) == 1
 
 
-def test_start_subcommand_fails_when_seed_missing(tmp_path, monkeypatch):
+def test_start_subcommand_fails_when_seed_missing(tmp_path, monkeypatch, capsys):
     from booking_bot.orchestrator import cli
-    from booking_bot import config, exceptions
+    from booking_bot import config
 
     monkeypatch.setattr(config, "ROOT", tmp_path)
     monkeypatch.setattr(config, "RUNS_DIR", tmp_path / "data" / "runs")
@@ -259,22 +259,25 @@ def test_start_subcommand_fails_when_seed_missing(tmp_path, monkeypatch):
     inp = tmp_path / "file.xlsx"
     inp.write_text("fake")
 
-    with pytest.raises(exceptions.AuthSeedMissing):
-        cli.main([
-            "start", "--source", "NOSEED", "--input", str(inp),
-            "--operator-phones", "9111111111,9222222222",
-            "--clones-per-operator", "3",
-            "--no-monitor",
-        ])
+    rc = cli.main([
+        "start", "--source", "NOSEED", "--input", str(inp),
+        "--operator-phones", "9111111111,9222222222",
+        "--clones-per-operator", "3",
+        "--no-monitor",
+    ])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "no seed dir" in err
+    assert "op1" in err and "op2" in err
 
 
 def test_start_subcommand_fails_when_seed_phone_mismatches(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, capsys,
 ):
     """If operator passes phones in a different order than auth was run,
     the seed_phone.json sidecars no longer match → loud error."""
     from booking_bot.orchestrator import cli
-    from booking_bot import config, exceptions
+    from booking_bot import config
     from datetime import datetime, timezone
 
     monkeypatch.setattr(config, "ROOT", tmp_path)
@@ -295,10 +298,12 @@ def test_start_subcommand_fails_when_seed_phone_mismatches(
     inp = tmp_path / "file.xlsx"
     inp.write_text("fake")
 
-    with pytest.raises(exceptions.AuthSeedMissing, match="mismatch"):
-        cli.main([
-            "start", "--source", "MULTI", "--input", str(inp),
-            "--operator-phones", "9222222222,9111111111",
-            "--clones-per-operator", "1",
-            "--no-monitor",
-        ])
+    rc = cli.main([
+        "start", "--source", "MULTI", "--input", str(inp),
+        "--operator-phones", "9222222222,9111111111",
+        "--clones-per-operator", "1",
+        "--no-monitor",
+    ])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "mismatch" in err

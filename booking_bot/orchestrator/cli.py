@@ -7,6 +7,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -197,6 +198,11 @@ def run_start(
     lock_path = _acquire_lock(source)
     try:
         if operator_phones is not None:
+            if chunk_size is not None or num_chunks is not None:
+                log.warning(
+                    "--chunk-size and --instances are ignored when "
+                    "--operator-phones is set (multi-operator mode owns parallelism)"
+                )
             _verify_operator_seeds(source, operator_phones)
             chunks = splitter.split(
                 source, input_file,
@@ -239,13 +245,23 @@ def main(argv: list[str] | None = None) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
     if args.command == "start":
-        return run_start(
-            source=args.source, input_file=args.input,
-            chunk_size=args.chunk_size, num_chunks=args.instances,
-            operator_phones=args.operator_phones,
-            clones_per_operator=args.clones_per_operator,
-            headed=args.headed, no_monitor=args.no_monitor,
-        )
+        try:
+            return run_start(
+                source=args.source, input_file=args.input,
+                chunk_size=args.chunk_size, num_chunks=args.instances,
+                operator_phones=args.operator_phones,
+                clones_per_operator=args.clones_per_operator,
+                headed=args.headed, no_monitor=args.no_monitor,
+            )
+        except exceptions.AuthSeedMissing as e:
+            print(f"[orchestrator] ERROR: {e}", file=sys.stderr, flush=True)
+            print(
+                "[orchestrator] rerun `orchestrator auth --source <SOURCE> "
+                "--operator-phones <list>` with the same phones (in the same "
+                "order) to refresh the seeds.",
+                file=sys.stderr, flush=True,
+            )
+            return 1
     if args.command == "auth":
         if args.operator_phones is not None:
             phones = args.operator_phones
