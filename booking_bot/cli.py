@@ -798,7 +798,13 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
             auth_result = login_if_needed(frame, config.OPERATOR_PHONE, _prompt_otp)
             if auth_result == "cooldown_wait":
                 # Section 1 + Section 3: cooldown refused to type phone.
-                # Enter quiet retry — 30 min of silent reload-and-poll.
+                # Enter quiet retry — 30 min of silent poll-and-watch.
+                # Write phase="authenticating" so the orchestrator's
+                # re-auth banner (monitor.build_operator_reauth_banner,
+                # which fires on phase=='authenticating' + idle > 60s)
+                # triggers ~1 min into the wait instead of staying
+                # invisible at phase='starting' for the entire 30 min.
+                _write_heartbeat("authenticating", store)
                 outcome = _quiet_retry_until_alive_or_dead(page, pb, store)
                 if outcome == "drained":
                     log.info(
@@ -807,10 +813,33 @@ def _run_session_attempt(store, args, pb, pre_handles) -> None:
                     )
                     return
                 if outcome == "needs_otp":
-                    # Section 5: fresh OTP would unblock real work. Clear
-                    # the cooldown file so login_if_needed accepts a new
+                    if _HEADLESS:
+                        # Parallel orchestrator chunks run --headless: no
+                        # GUI, no stdin, no way to receive an OTP. If we
+                        # fell through to login_if_needed here we would
+                        # (a) type the operator phone → SMS to the
+                        # operator → repeated across every parallel
+                        # chunk that simultaneously exited quiet retry
+                        # (OTP flood), and (b) hang inside
+                        # wait_until_settled for up to STUCK_THRESHOLD_S
+                        # with no hope of progress. Fail fast instead so
+                        # the chunk dies cleanly and the operator can
+                        # manually re-auth the slot's auth-seed and
+                        # restart the chunk via the orchestrator.
+                        last_err = (
+                            "headless chunk: quiet retry exhausted while "
+                            "session is dead. Refusing to type operator "
+                            "phone (would flood OTP SMS with no listener). "
+                            "Operator must re-authenticate this slot's "
+                            "auth-seed and restart the chunk."
+                        )
+                        _write_heartbeat("failed", store, last_error=last_err)
+                        raise FatalError(last_err)
+                    # Interactive/headed mode: the operator can type an
+                    # OTP via the GUI popup or terminal. Clear the
+                    # cooldown file so login_if_needed accepts a new
                     # phone submission, re-fetch the frame, and call it
-                    # again. The operator will hear the idle alarm from
+                    # again. The operator hears the idle alarm from
                     # _prompt_otp's watchdog thread.
                     browser.clear_auth_cooldown()
                     frame = browser.get_chat_frame(page)

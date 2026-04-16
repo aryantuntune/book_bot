@@ -8,6 +8,17 @@ One-page reference for running the K-operator orchestrator.
 - Your input file is under `Input/` (e.g. `Input/lalji-final-1604-52am.xlsx`).
 - No other `orchestrator start` is currently running for the same source.
 
+> **Important — HPCL per-account session limit.** HPCL allows ~1 active session per
+> operator account. If you run the legacy path with `--instances N` (no
+> `--operator-phones`) or clone a single operator across multiple parallel
+> chunks, HPCL will invalidate all of those sessions within ~90 seconds of the
+> second chunk connecting, every chunk will land on `NEEDS_OPERATOR_AUTH`, and
+> the 30-min quiet-retry will drain without recovery. **Real parallelism
+> requires K distinct HPCL operator phones** (one session per account). With
+> one operator phone the orchestrator's only safe configuration is
+> `--operator-phones <one-phone> --clones-per-operator 1` (i.e. sequential,
+> same throughput as the single-bot path).
+
 ## Step 1 — Seed auth for all K operators (one OTP per operator)
 
 ```bash
@@ -50,3 +61,4 @@ Recovery:
 - **`AuthSeedMissing`:** one or more slots' seeds are missing/stale. Run Step 1 again for the listed slots.
 - **`seeded for X, passed Y` mismatch:** the phone list order changed between `auth` and `start`. Pass the phones in the same order, or re-run `auth` with the new order.
 - **All 9 bots kicked simultaneously:** HPCL may have done an account-level session flush. Run Step 1 for all K operators again.
+- **Every chunk immediately fails with "headless chunk: quiet retry exhausted while session is dead":** the auth-seed for that slot was invalidated server-side shortly after the chunks connected. This usually means >1 parallel chunk is sharing a single HPCL account (see the Pre-flight note above — use one operator phone per concurrent chunk). Re-auth the affected slot(s) in Step 1 and restart; if the failure is universal, reduce `--clones-per-operator` to 1.
