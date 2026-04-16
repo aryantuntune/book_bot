@@ -20,6 +20,17 @@ from booking_bot.orchestrator.heartbeat import Heartbeat
 
 log = logging.getLogger("orchestrator.monitor")
 
+_REAUTH_IDLE_THRESHOLD_S = 60
+"""A chunk is only considered stuck-in-auth once its last_activity_at
+is this old — shorter bursts are normal OTP entry, not a dead session."""
+
+_REAUTH_MIN_CHUNKS = 2
+"""Minimum stuck chunks sharing an operator_slot before the banner
+fires. A single stuck chunk might be a local quirk; two or more
+pointing at the same operator is the signal that HPCL killed the
+server-side sessions for that operator."""
+
+
 _PHASE_COLORS = {
     "starting":       "cyan",
     "authenticating": "cyan",
@@ -94,27 +105,27 @@ def build_table(hbs: Iterable[Heartbeat]) -> Table:
 
 
 def build_operator_reauth_banner(hbs: Iterable[Heartbeat]) -> str:
-    """Return a single high-visibility warning line if >=2 chunks belonging
-    to the same operator_slot are stuck in an auth-pending state for
-    more than 60s. Returns '' when nothing is stuck — callers can check
-    truthiness to decide whether to render.
+    """Return a single high-visibility warning line if >=_REAUTH_MIN_CHUNKS
+    chunks belonging to the same operator_slot are stuck in an auth-pending
+    state for more than _REAUTH_IDLE_THRESHOLD_S. Returns '' when nothing
+    is stuck — callers can check truthiness to decide whether to render.
 
-    The detection heuristic: phase=='authenticating' and idle > 60s. This
-    is the exact shape of the cooldown_wait quiet-retry loop when HPCL
-    has killed the operator's sessions server-side; the operator's
-    correct response is to re-auth *that* slot and let shared_auth
-    propagate."""
+    The detection heuristic: phase=='authenticating' and idle above the
+    threshold. This is the exact shape of the cooldown_wait quiet-retry
+    loop when HPCL has killed the operator's sessions server-side; the
+    operator's correct response is to re-auth *that* slot and let
+    shared_auth propagate."""
     by_slot: dict[str, int] = {}
     for hb in hbs:
         if hb.operator_slot is None:
             continue
         if hb.phase != "authenticating":
             continue
-        if _idle_seconds(hb) <= 60:
+        if _idle_seconds(hb) <= _REAUTH_IDLE_THRESHOLD_S:
             continue
         by_slot[hb.operator_slot] = by_slot.get(hb.operator_slot, 0) + 1
     stuck_slots = sorted(
-        (slot for slot, n in by_slot.items() if n >= 2)
+        (slot for slot, n in by_slot.items() if n >= _REAUTH_MIN_CHUNKS)
     )
     if not stuck_slots:
         return ""

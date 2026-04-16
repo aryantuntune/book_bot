@@ -255,3 +255,21 @@ def test_build_operator_reauth_banner_ignores_single_stuck_chunk():
         _make_hb("T-002", slot="op1", phase="booking", idle_secs=0),
     ]
     assert build_operator_reauth_banner(hbs) == ""
+
+
+def test_build_operator_reauth_banner_ignores_none_slot():
+    """Legacy pre-multi-op chunks carry operator_slot=None and must never
+    poison the per-slot counters — even when they appear stuck alongside
+    a genuinely stuck op1 cohort, the banner must attribute the alert to
+    op1 only, never to None."""
+    from booking_bot.orchestrator.monitor import build_operator_reauth_banner
+    hbs = [
+        _make_hb("T-legacy-1", slot=None, phase="authenticating", idle_secs=300),
+        _make_hb("T-legacy-2", slot=None, phase="authenticating", idle_secs=300),
+        _make_hb("T-001", slot="op1", phase="authenticating", idle_secs=300),
+        _make_hb("T-002", slot="op1", phase="authenticating", idle_secs=300),
+    ]
+    banner = build_operator_reauth_banner(hbs)
+    assert "op1" in banner
+    assert "2 chunks" in banner
+    assert "None" not in banner
