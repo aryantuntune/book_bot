@@ -17,6 +17,28 @@ from booking_bot.orchestrator import auth_template, heartbeat, monitor, spawner,
 log = logging.getLogger("orchestrator.cli")
 
 
+def _parse_operator_phones(raw: str) -> list[str]:
+    """Parse a comma-separated phone list: '9111111111,9222222222'.
+    Validates each entry is exactly 10 digits and rejects duplicates.
+    Raises argparse.ArgumentTypeError for any failure so argparse
+    prints a clean error and exits with status 2."""
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError("operator phone list is empty")
+    if len(parts) > 10:
+        raise argparse.ArgumentTypeError(
+            f"at most 10 operator phones supported; got {len(parts)}"
+        )
+    for p in parts:
+        if not (p.isdigit() and len(p) == 10):
+            raise argparse.ArgumentTypeError(
+                f"operator phone must be exactly 10 digits; got {p!r}"
+            )
+    if len(set(parts)) != len(parts):
+        raise argparse.ArgumentTypeError("duplicate operator phone in list")
+    return parts
+
+
 # ---- Internal seams (monkey-patched by tests) ----
 
 def _ensure_auth_seed(source: str) -> Path:
@@ -53,9 +75,18 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--no-monitor", action="store_true",
                        help="skip the automatic monitor handoff after spawn")
 
-    auth = sub.add_parser("auth", help="pre-authenticate an auth-seed profile")
+    auth = sub.add_parser("auth", help="pre-authenticate operator auth-seed profiles")
     auth.add_argument("--source", required=True)
-    auth.add_argument("--operator-phone", default=None)
+    phones_group = auth.add_mutually_exclusive_group(required=True)
+    phones_group.add_argument(
+        "--operator-phones", type=_parse_operator_phones, default=None,
+        help="comma-separated HPCL operator phones; one auth-seed per phone "
+             "(slots op1..opK)",
+    )
+    phones_group.add_argument(
+        "--operator-phone", default=None,
+        help="legacy single-phone form; implies slot op1",
+    )
 
     mon = sub.add_parser("monitor", help="attach the live terminal UI")
     mon.add_argument("--source", default=None)
@@ -158,10 +189,18 @@ def main(argv: list[str] | None = None) -> int:
             headed=args.headed, no_monitor=args.no_monitor,
         )
     if args.command == "auth":
-        path = auth_template.ensure_auth_seed(
-            args.source, operator_phone=args.operator_phone,
-        )
-        print(f"[orchestrator] auth seed ready: {path}")
+        if args.operator_phones is not None:
+            phones = args.operator_phones
+        else:
+            if args.operator_phone is None:
+                ap.error("auth requires --operator-phones or --operator-phone")
+            phone = args.operator_phone
+            if not (phone.isdigit() and len(phone) == 10):
+                ap.error(f"--operator-phone must be 10 digits; got {phone!r}")
+            phones = [phone]
+        seeds = auth_template.ensure_auth_seeds(args.source, phones)
+        for slot, path in seeds.items():
+            print(f"[orchestrator] auth seed {slot} ready: {path}")
         return 0
     if args.command == "monitor":
         return monitor.run_monitor(source_filter=args.source)

@@ -94,3 +94,56 @@ class _StubHandle:
     def __init__(self, chunk_id):
         self.chunk_id = chunk_id
         self.pid = 12345
+
+
+def test_auth_subcommand_parses_operator_phones_list(monkeypatch):
+    from booking_bot.orchestrator import cli, auth_template
+    captured = {}
+
+    def fake_ensure(source, phones):
+        captured["source"] = source
+        captured["phones"] = phones
+        return {f"op{i+1}": None for i in range(len(phones))}
+
+    monkeypatch.setattr(auth_template, "ensure_auth_seeds", fake_ensure)
+    rc = cli.main([
+        "auth", "--source", "T",
+        "--operator-phones", "9111111111,9222222222,9333333333",
+    ])
+    assert rc == 0
+    assert captured["source"] == "T"
+    assert captured["phones"] == ["9111111111", "9222222222", "9333333333"]
+
+
+def test_auth_subcommand_legacy_singular_phone(monkeypatch):
+    from booking_bot.orchestrator import cli, auth_template
+    captured = {}
+
+    def fake_ensure(source, phones):
+        captured["phones"] = phones
+        return {"op1": None}
+
+    monkeypatch.setattr(auth_template, "ensure_auth_seeds", fake_ensure)
+    rc = cli.main([
+        "auth", "--source", "T", "--operator-phone", "9111111111",
+    ])
+    assert rc == 0
+    assert captured["phones"] == ["9111111111"]
+
+
+def test_auth_subcommand_rejects_malformed_phones(monkeypatch, capsys):
+    from booking_bot.orchestrator import cli
+    with pytest.raises(SystemExit):
+        cli.main([
+            "auth", "--source", "T",
+            "--operator-phones", "abc,9111111111",
+        ])
+
+
+def test_auth_subcommand_rejects_duplicate_phones(monkeypatch):
+    from booking_bot.orchestrator import cli
+    with pytest.raises(SystemExit):
+        cli.main([
+            "auth", "--source", "T",
+            "--operator-phones", "9111111111,9111111111",
+        ])
