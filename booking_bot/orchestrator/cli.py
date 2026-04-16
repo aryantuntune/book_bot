@@ -30,7 +30,7 @@ def _parse_operator_phones(raw: str) -> list[str]:
             f"at most 10 operator phones supported; got {len(parts)}"
         )
     for p in parts:
-        if not (p.isdigit() and len(p) == 10):
+        if not (p.isascii() and p.isdigit() and len(p) == 10):
             raise argparse.ArgumentTypeError(
                 f"operator phone must be exactly 10 digits; got {p!r}"
             )
@@ -192,12 +192,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.operator_phones is not None:
             phones = args.operator_phones
         else:
-            if args.operator_phone is None:
-                ap.error("auth requires --operator-phones or --operator-phone")
-            phone = args.operator_phone
-            if not (phone.isdigit() and len(phone) == 10):
-                ap.error(f"--operator-phone must be 10 digits; got {phone!r}")
-            phones = [phone]
+            try:
+                phones = _parse_operator_phones(args.operator_phone)
+            except argparse.ArgumentTypeError as e:
+                ap.error(str(e))
         seeds = auth_template.ensure_auth_seeds(args.source, phones)
         for slot, path in seeds.items():
             print(f"[orchestrator] auth seed {slot} ready: {path}")

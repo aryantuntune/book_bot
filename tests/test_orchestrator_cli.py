@@ -147,3 +147,15 @@ def test_auth_subcommand_rejects_duplicate_phones(monkeypatch):
             "auth", "--source", "T",
             "--operator-phones", "9111111111,9111111111",
         ])
+
+
+def test_auth_subcommand_legacy_singular_phone_rejects_unicode_digits(monkeypatch):
+    """Defensive: Devanagari digits look digit-ish to str.isdigit() but
+    won't submit correctly to HPCL. Validator must reject them on both
+    the plural and singular paths."""
+    from booking_bot.orchestrator import cli
+    with pytest.raises(SystemExit):
+        cli.main([
+            "auth", "--source", "T",
+            "--operator-phone", "९111111111",  # leading Devanagari 9
+        ])
