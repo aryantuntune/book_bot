@@ -5,6 +5,7 @@ ChunkSpecs. ensure_auth_seed's interactive path (Path C) is NOT tested
 here — it needs a real browser; tests stub out _interactive_auth_seed
 so paths A and B can be tested without touching Playwright."""
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -452,7 +453,13 @@ def test_interactive_auth_seed_writes_last_auth_on_alive_state(
     """Regression for the 2026-04-17 bug: _interactive_auth_seed used to
     poll for last_auth.json but nothing in that path ever wrote the
     file. The fix observes detect_state and calls mark_auth_success
-    when the chat lands in an alive state after operator login."""
+    when the chat lands in an alive state after operator login.
+
+    Also regressions the second 2026-04-17 bug: HPCL's auth token lives
+    in JS sessionStorage, which doesn't survive a browser restart.
+    write_shared_auth_state captures it into shared_auth-<slot>.json
+    while the live page is still open so the cloned chunk profiles can
+    replay it via inject_shared_auth_cookies."""
     from booking_bot import browser, chat as chat_mod
 
     fake_ctx = type("Ctx", (), {"close": lambda self: None})()
@@ -479,16 +486,41 @@ def test_interactive_auth_seed_writes_last_auth_on_alive_state(
         browser, "mark_auth_success",
         lambda: mark_calls.append(True),
     )
+    # Capture the slot env var as write_shared_auth_state sees it —
+    # this is what proves the fix routes the snapshot to
+    # shared_auth-<slot>.json instead of the legacy file.
+    observed_slot = {"value": "__unset__"}
+
+    def fake_write_shared(page_arg):
+        observed_slot["value"] = os.environ.get(config.OPERATOR_SLOT_ENV)
+
+    monkeypatch.setattr(
+        browser, "write_shared_auth_state", fake_write_shared,
+    )
     monkeypatch.setattr(auth_template.time, "sleep", lambda _s: None)
 
+    # Start with the env var unset so we can prove the function sets it
+    # to the right slot then restores it to absent.
+    monkeypatch.delenv(config.OPERATOR_SLOT_ENV, raising=False)
+
     path = auth_template._interactive_auth_seed(
-        "INT", slot="op1", operator_phone="9111111111",
+        "INT", slot="op2", operator_phone="9222222222",
     )
 
-    assert path == auth_env / ".chromium-profile-INT-op1-auth-seed"
+    assert path == auth_env / ".chromium-profile-INT-op2-auth-seed"
     assert len(mark_calls) == 1, (
         "mark_auth_success must be called exactly once when detect_state "
         "lands on an alive state — this is what writes last_auth.json"
+    )
+    assert observed_slot["value"] == "op2", (
+        f"write_shared_auth_state must see BOOKING_BOT_OPERATOR_SLOT='op2' "
+        f"so the snapshot lands at shared_auth-op2.json; got "
+        f"{observed_slot['value']!r}"
+    )
+    assert os.environ.get(config.OPERATOR_SLOT_ENV) is None, (
+        "slot env var must be restored to its prior state after the "
+        "write; otherwise subsequent ensure_auth_seeds iterations would "
+        "see a stale slot"
     )
 
 

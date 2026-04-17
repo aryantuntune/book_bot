@@ -8,8 +8,10 @@ is equivalent to transferring an authenticated session, and HPCL's
 long session lifetime (~15h) makes this practical for a day's work."""
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
 import shutil
 import time
 from datetime import datetime, timezone
@@ -239,6 +241,25 @@ def ensure_auth_seed(
 _ALIVE_STATES = ("READY_FOR_CUSTOMER", "MAIN_MENU", "BOOK_FOR_OTHERS_MENU")
 
 
+@contextlib.contextmanager
+def _slot_env(slot: str):
+    """Temporarily set BOOKING_BOT_OPERATOR_SLOT so functions that pick a
+    slot-aware shared_auth path (browser._shared_auth_path) route the
+    write to shared_auth-<slot>.json instead of the legacy file. Restores
+    the prior value (or absence) on exit so the process-wide env isn't
+    left polluted for subsequent slots in the same ensure_auth_seeds run."""
+    key = config.OPERATOR_SLOT_ENV
+    prev = os.environ.get(key)
+    os.environ[key] = slot
+    try:
+        yield
+    finally:
+        if prev is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = prev
+
+
 def _interactive_auth_seed(
     source: str, *, slot: str = "op1", operator_phone: str | None = None,
 ) -> Path:
@@ -282,9 +303,20 @@ def _interactive_auth_seed(
                 if state in _ALIVE_STATES:
                     log.info(
                         f"auth seed {source}/{slot}: session alive "
-                        f"(state={state!r}); writing last_auth.json"
+                        f"(state={state!r}); capturing auth state"
                     )
                     browser.mark_auth_success()
+                    # HPCL stores its auth token in JS sessionStorage,
+                    # which Chromium does not persist to disk across a
+                    # fresh launch_persistent_context. Capture cookies +
+                    # localStorage + sessionStorage to shared_auth-<slot>.json
+                    # while the live page is still open so chunks launched
+                    # against cloned profiles can replay the storage via
+                    # inject_shared_auth_cookies' add_init_script. Without
+                    # this, the clone lands on a brand-new tab with an
+                    # empty sessionStorage and HPCL shows the login screen.
+                    with _slot_env(slot):
+                        browser.write_shared_auth_state(page)
                     time.sleep(2.0)  # let any trailing JS settle
                     return seed
             except Exception as e:
