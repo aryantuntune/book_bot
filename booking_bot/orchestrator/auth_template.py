@@ -236,17 +236,32 @@ def ensure_auth_seed(
     return seeds["op1"]
 
 
+_ALIVE_STATES = ("READY_FOR_CUSTOMER", "MAIN_MENU", "BOOK_FOR_OTHERS_MENU")
+
+
 def _interactive_auth_seed(
     source: str, *, slot: str = "op1", operator_phone: str | None = None,
 ) -> Path:
     """Interactive Path C. Launches a real Chromium window against
-    `.chromium-profile-<source>-<slot>-auth-seed/`, polls the profile's
-    last_auth.json, and closes the browser once the operator logs in.
-    Raises AuthSeedTimeout on timeout."""
-    from booking_bot import browser  # lazy — keeps Playwright off the import graph for unit tests
+    `.chromium-profile-<source>-<slot>-auth-seed/`, polls the live chat
+    frame for a logged-in state, writes last_auth.json via
+    browser.mark_auth_success, and closes the browser. Raises
+    AuthSeedTimeout on timeout.
+
+    Historical bug (fixed 2026-04-17): the original poll loop watched
+    the seed dir for last_auth.json to appear. Nothing in the
+    interactive flow ever writes that file — it's only written from
+    auth.login_if_needed, which this path never calls — so the loop
+    timed out on every fresh operator even when the login succeeded
+    on-screen. Op1 happened to work by accident via Path B's copytree
+    from the pre-existing main profile. This function now observes
+    the login itself: poll chat.detect_state, and once the state is
+    MAIN_MENU / READY_FOR_CUSTOMER / BOOK_FOR_OTHERS_MENU, mark auth
+    success on the seed profile and return."""
+    from booking_bot import browser, chat  # lazy — keeps Playwright off the import graph for unit tests
     seed = _seed_path(source, slot)
     seed.mkdir(parents=True, exist_ok=True)
-    pw, _browser_obj, ctx, _page = browser.start_browser(
+    pw, _browser_obj, ctx, page = browser.start_browser(
         headless=False,
         profile_suffix=f"{source}-{slot}-auth-seed",
     )
@@ -259,15 +274,33 @@ def _interactive_auth_seed(
         flush=True,
     )
     deadline = time.monotonic() + config.ORCHESTRATOR_AUTH_TIMEOUT_S
-    poll_start = time.monotonic()
     try:
+        frame = browser.get_chat_frame(page)
         while time.monotonic() < deadline:
-            if _auth_fresh(seed, max_age_s=60.0):
-                last_mtime = (seed / "last_auth.json").stat().st_mtime
-                if last_mtime >= poll_start:
-                    time.sleep(5.0)  # let redirects settle
+            try:
+                state = chat.detect_state(frame)
+                if state in _ALIVE_STATES:
+                    log.info(
+                        f"auth seed {source}/{slot}: session alive "
+                        f"(state={state!r}); writing last_auth.json"
+                    )
+                    browser.mark_auth_success()
+                    time.sleep(2.0)  # let any trailing JS settle
                     return seed
-            time.sleep(2.0)
+            except Exception as e:
+                # Frame may have detached during login navigation
+                # (HPCL sometimes redirects post-OTP). Re-acquire the
+                # frame and keep polling — the next iteration will
+                # usually land on the new post-login page.
+                log.debug(
+                    f"auth seed {source}/{slot}: poll error "
+                    f"({type(e).__name__}: {e}); re-acquiring frame"
+                )
+                try:
+                    frame = browser.get_chat_frame(page)
+                except Exception:
+                    pass
+            time.sleep(3.0)
         raise exceptions.AuthSeedTimeout(
             f"auth seed for {source}/{slot} timed out after "
             f"{config.ORCHESTRATOR_AUTH_TIMEOUT_S}s"

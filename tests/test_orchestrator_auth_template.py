@@ -444,3 +444,90 @@ def test_clone_to_chunks_raises_when_slot_seed_missing(auth_env):
     )
     with pytest.raises(FileNotFoundError, match="op2"):
         auth_template.clone_to_chunks("MULTI", [chunk])
+
+
+def test_interactive_auth_seed_writes_last_auth_on_alive_state(
+    auth_env, monkeypatch,
+):
+    """Regression for the 2026-04-17 bug: _interactive_auth_seed used to
+    poll for last_auth.json but nothing in that path ever wrote the
+    file. The fix observes detect_state and calls mark_auth_success
+    when the chat lands in an alive state after operator login."""
+    from booking_bot import browser, chat as chat_mod
+
+    fake_ctx = type("Ctx", (), {"close": lambda self: None})()
+    fake_pw = type("Pw", (), {"stop": lambda self: None})()
+    fake_page = object()
+    fake_frame = object()
+
+    monkeypatch.setattr(
+        browser, "start_browser",
+        lambda headless, profile_suffix: (fake_pw, None, fake_ctx, fake_page),
+    )
+    monkeypatch.setattr(
+        browser, "get_chat_frame",
+        lambda page: fake_frame,
+    )
+    # Simulate operator completing the OTP on the 2nd poll.
+    state_sequence = iter(["NEEDS_OPERATOR_OTP", "MAIN_MENU"])
+    monkeypatch.setattr(
+        chat_mod, "detect_state",
+        lambda frame: next(state_sequence),
+    )
+    mark_calls = []
+    monkeypatch.setattr(
+        browser, "mark_auth_success",
+        lambda: mark_calls.append(True),
+    )
+    monkeypatch.setattr(auth_template.time, "sleep", lambda _s: None)
+
+    path = auth_template._interactive_auth_seed(
+        "INT", slot="op1", operator_phone="9111111111",
+    )
+
+    assert path == auth_env / ".chromium-profile-INT-op1-auth-seed"
+    assert len(mark_calls) == 1, (
+        "mark_auth_success must be called exactly once when detect_state "
+        "lands on an alive state — this is what writes last_auth.json"
+    )
+
+
+def test_interactive_auth_seed_raises_timeout_if_never_alive(
+    auth_env, monkeypatch,
+):
+    """If the operator never completes login within the timeout window,
+    AuthSeedTimeout must fire — never silently hang or fabricate a
+    last_auth.json that wasn't earned."""
+    from booking_bot import browser, chat as chat_mod
+
+    fake_ctx = type("Ctx", (), {"close": lambda self: None})()
+    fake_pw = type("Pw", (), {"stop": lambda self: None})()
+    monkeypatch.setattr(
+        browser, "start_browser",
+        lambda headless, profile_suffix: (fake_pw, None, fake_ctx, object()),
+    )
+    monkeypatch.setattr(
+        browser, "get_chat_frame",
+        lambda page: object(),
+    )
+    monkeypatch.setattr(
+        chat_mod, "detect_state",
+        lambda frame: "NEEDS_OPERATOR_AUTH",  # never moves off the login screen
+    )
+    mark_calls = []
+    monkeypatch.setattr(
+        browser, "mark_auth_success",
+        lambda: mark_calls.append(True),
+    )
+    # Shrink the timeout so the test actually terminates.
+    monkeypatch.setattr(config, "ORCHESTRATOR_AUTH_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(auth_template.time, "sleep", lambda _s: None)
+
+    with pytest.raises(exceptions.AuthSeedTimeout, match="op1"):
+        auth_template._interactive_auth_seed(
+            "INT", slot="op1", operator_phone="9111111111",
+        )
+    assert mark_calls == [], (
+        "mark_auth_success must NOT be called when detect_state never "
+        "reaches an alive state"
+    )
