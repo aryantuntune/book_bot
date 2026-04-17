@@ -405,7 +405,27 @@ def start_browser(
     # on MAIN_MENU / READY_FOR_CUSTOMER and login_if_needed becomes a nop.
     inject_shared_auth_cookies(ctx)
     log.info(f"navigating to {config.URL}")
-    page.goto(config.URL, wait_until="domcontentloaded", timeout=60_000)
+    # HPCL's gateway sometimes returns 502 or stalls the initial SSL
+    # handshake on cold connects. A single 60s goto is not enough when
+    # it's flapping; retry a few times so auth-seed startup and chunk
+    # launch don't die on a transient gateway blip. get_chat_frame
+    # handles post-load flakiness separately; this loop only covers
+    # the initial page.goto call.
+    last_err: Exception | None = None
+    for goto_attempt in (1, 2, 3):
+        try:
+            page.goto(config.URL, wait_until="domcontentloaded", timeout=60_000)
+            last_err = None
+            break
+        except PWTimeoutError as e:
+            last_err = e
+            log.warning(
+                f"page.goto attempt {goto_attempt}/3 timed out "
+                f"({type(e).__name__}); retrying after 5s"
+            )
+            time.sleep(5.0)
+    if last_err is not None:
+        raise last_err
     page.wait_for_timeout(config.PAGE_LOAD_WAIT_S * 1000)
     install_gateway_listener(page)
     return pw, None, ctx, page
