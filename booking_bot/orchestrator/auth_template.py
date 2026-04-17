@@ -296,8 +296,36 @@ def _interactive_auth_seed(
     )
     deadline = time.monotonic() + config.ORCHESTRATOR_AUTH_TIMEOUT_S
     try:
-        frame = browser.get_chat_frame(page)
+        frame = None
         while time.monotonic() < deadline:
+            # Lazily (re-)acquire the chat frame. HPCL's gateway
+            # sometimes 502-flaps for tens of seconds during the
+            # initial render and mid-session, and browser.get_chat_frame
+            # only retries 4× over 40s before raising IframeLostError.
+            # Catching that here and looping lets us absorb longer
+            # outages without killing the operator's headed window —
+            # as long as HPCL recovers within the 15-min auth timeout,
+            # the operator just sees the blank tab eventually render.
+            if frame is None:
+                try:
+                    frame = browser.get_chat_frame(page)
+                except Exception as e:
+                    log.warning(
+                        f"auth seed {source}/{slot}: chat frame not ready "
+                        f"({type(e).__name__}: {e}); reloading and "
+                        f"retrying within the auth timeout"
+                    )
+                    try:
+                        page.reload(
+                            wait_until="domcontentloaded", timeout=60_000,
+                        )
+                    except Exception as reload_err:
+                        log.debug(
+                            f"auth seed {source}/{slot}: reload failed "
+                            f"({type(reload_err).__name__}: {reload_err})"
+                        )
+                    time.sleep(3.0)
+                    continue
             try:
                 state = chat.detect_state(frame)
                 if state in _ALIVE_STATES:
@@ -321,17 +349,14 @@ def _interactive_auth_seed(
                     return seed
             except Exception as e:
                 # Frame may have detached during login navigation
-                # (HPCL sometimes redirects post-OTP). Re-acquire the
-                # frame and keep polling — the next iteration will
-                # usually land on the new post-login page.
+                # (HPCL sometimes redirects post-OTP) or HPCL returned
+                # a gateway error mid-poll. Drop the cached frame so
+                # the next iteration re-acquires it and keep polling.
                 log.debug(
                     f"auth seed {source}/{slot}: poll error "
                     f"({type(e).__name__}: {e}); re-acquiring frame"
                 )
-                try:
-                    frame = browser.get_chat_frame(page)
-                except Exception:
-                    pass
+                frame = None
             time.sleep(3.0)
         raise exceptions.AuthSeedTimeout(
             f"auth seed for {source}/{slot} timed out after "

@@ -524,6 +524,57 @@ def test_interactive_auth_seed_writes_last_auth_on_alive_state(
     )
 
 
+def test_interactive_auth_seed_survives_initial_get_chat_frame_failure(
+    auth_env, monkeypatch,
+):
+    """HPCL's gateway can 502 for tens of seconds after the initial
+    navigation. The 2026-04-17 fix makes _interactive_auth_seed absorb
+    those failures by retrying get_chat_frame within the 15-min auth
+    timeout, rather than bombing out after the first 40s attempt."""
+    from booking_bot import browser, chat as chat_mod
+    from booking_bot.exceptions import IframeLostError
+
+    fake_ctx = type("Ctx", (), {"close": lambda self: None})()
+    fake_pw = type("Pw", (), {"stop": lambda self: None})()
+    fake_page = type("P", (), {"reload": lambda self, **kw: None})()
+    fake_frame = object()
+
+    monkeypatch.setattr(
+        browser, "start_browser",
+        lambda headless, profile_suffix: (fake_pw, None, fake_ctx, fake_page),
+    )
+    # First 2 calls to get_chat_frame simulate HPCL 502s; 3rd succeeds.
+    frame_attempts = iter([
+        IframeLostError("chat scroller never populated (attempt 1)"),
+        IframeLostError("chat scroller never populated (attempt 2)"),
+        fake_frame,
+    ])
+
+    def fake_get_chat_frame(page):
+        result = next(frame_attempts)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(browser, "get_chat_frame", fake_get_chat_frame)
+    monkeypatch.setattr(
+        chat_mod, "detect_state",
+        lambda frame: "MAIN_MENU",
+    )
+    monkeypatch.setattr(browser, "mark_auth_success", lambda: None)
+    monkeypatch.setattr(browser, "write_shared_auth_state", lambda page: None)
+    monkeypatch.setattr(auth_template.time, "sleep", lambda _s: None)
+
+    path = auth_template._interactive_auth_seed(
+        "INT", slot="op1", operator_phone="9111111111",
+    )
+
+    assert path == auth_env / ".chromium-profile-INT-op1-auth-seed", (
+        "must succeed after the third get_chat_frame attempt rather than "
+        "bubbling the first IframeLostError"
+    )
+
+
 def test_interactive_auth_seed_raises_timeout_if_never_alive(
     auth_env, monkeypatch,
 ):
