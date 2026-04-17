@@ -641,14 +641,19 @@ def _quiet_retry_until_alive_or_dead(page, pb, store) -> str:
                 log.info(
                     f"quiet retry: newer shared_auth.json detected "
                     f"(written_at={shared.get('written_at_utc')}); "
-                    f"injecting cookies and reloading once"
+                    f"injecting shared auth state and reloading once"
                 )
                 last_shared_written_at = shared.get("written_at_utc")
+                # Route through inject_shared_auth_cookies so we get the
+                # full transplant — cookies AND the init script that seeds
+                # localStorage/sessionStorage on the next page load. Doing
+                # add_cookies alone misses HPCL's localStorage-based
+                # session token and the transplant silently no-ops.
                 try:
-                    page.context.add_cookies(shared["cookies"])
+                    browser.inject_shared_auth_cookies(page.context)
                 except Exception as e:
                     log.warning(
-                        f"quiet retry: add_cookies failed "
+                        f"quiet retry: shared-auth inject failed "
                         f"({type(e).__name__}: {e})"
                     )
                 try:

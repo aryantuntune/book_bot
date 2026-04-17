@@ -152,10 +152,49 @@ def _shared_auth_path() -> Path:
     return Path(config.ROOT) / config.SHARED_AUTH_FILENAME
 
 
+def _dump_hpcl_storage(page: Page) -> dict:
+    """Read localStorage and sessionStorage from the current page. Playwright
+    can only read storage for the page's own origin, so we ensure the page
+    is actually at the HPCL origin before we trust the output. Returns a
+    dict with keys ls, ss, origin — empty dicts if the read fails for any
+    reason (non-HPCL origin, frame gone, page navigating)."""
+    try:
+        data = page.evaluate(
+            """() => {
+                const out = { ls: {}, ss: {}, origin: null };
+                try { out.origin = window.location.origin; } catch (e) {}
+                try {
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const k = localStorage.key(i);
+                        out.ls[k] = localStorage.getItem(k);
+                    }
+                } catch (e) {}
+                try {
+                    for (let i = 0; i < sessionStorage.length; i++) {
+                        const k = sessionStorage.key(i);
+                        out.ss[k] = sessionStorage.getItem(k);
+                    }
+                } catch (e) {}
+                return out;
+            }"""
+        )
+        return data or {"ls": {}, "ss": {}, "origin": None}
+    except Exception as e:
+        log.warning(f"_dump_hpcl_storage failed: {type(e).__name__}: {e}")
+        return {"ls": {}, "ss": {}, "origin": None}
+
+
 def write_shared_auth_state(page: Page) -> None:
-    """Snapshot the current page-context's HPCL cookies and write them to
-    shared_auth.json atomically. Called by auth.py after every successful
-    operator login so other parallel instances can skip their own OTP.
+    """Snapshot cookies + localStorage + sessionStorage from the current
+    page's HPCL context and write them to shared_auth.json atomically.
+    Called by auth.py after every successful operator login so other
+    parallel instances can skip their own OTP.
+
+    HPCL's PWA empirically stores the authenticated session token in
+    localStorage (not cookies), so a cookies-only snapshot is useless —
+    injection succeeds but HPCL doesn't recognize the session. This
+    function captures all three storage surfaces so the transplant
+    actually works regardless of which one HPCL uses.
 
     Atomic write via <path>.tmp + os.replace — the NTFS rename is atomic
     for same-FS replaces, so a reader never sees a half-written file.
@@ -172,10 +211,29 @@ def write_shared_auth_state(page: Page) -> None:
             if "hpchatbot.hpcl.co.in" in (c.get("domain") or "")
             or "hpcl.co.in" in (c.get("domain") or "")
         ]
+        storage = _dump_hpcl_storage(page)
+        # Storage dump is only trustworthy when the page is on HPCL's origin.
+        # If we're on about:blank or some redirect, zero it out — injecting
+        # arbitrary other-origin storage into HPCL would be pointless at best
+        # and wipe real HPCL keys at worst.
+        storage_origin = storage.get("origin") or ""
+        if "hpchatbot.hpcl.co.in" not in storage_origin:
+            log.warning(
+                f"write_shared_auth_state: page origin is {storage_origin!r} "
+                f"not HPCL; storing cookies only, skipping localStorage/"
+                f"sessionStorage dump"
+            )
+            ls_data: dict = {}
+            ss_data: dict = {}
+        else:
+            ls_data = storage.get("ls") or {}
+            ss_data = storage.get("ss") or {}
         payload = {
             "written_at_utc": datetime.now(timezone.utc).isoformat(),
             "origin": "https://hpchatbot.hpcl.co.in",
             "cookies": hpcl_cookies,
+            "local_storage": ls_data,
+            "session_storage": ss_data,
         }
         path = _shared_auth_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -183,8 +241,11 @@ def write_shared_auth_state(page: Page) -> None:
         tmp.write_text(json.dumps(payload))
         os.replace(tmp, path)
         log.info(
-            f"wrote {path.name}: {len(hpcl_cookies)} HPCL "
-            f"cookie(s) available for other parallel instances"
+            f"wrote {path.name}: "
+            f"{len(hpcl_cookies)} cookie(s), "
+            f"{len(ls_data)} localStorage key(s), "
+            f"{len(ss_data)} sessionStorage key(s) "
+            f"available for other parallel instances"
         )
     except Exception as e:
         log.warning(
@@ -218,9 +279,27 @@ def read_shared_auth_state() -> dict | None:
             age = (datetime.now(timezone.utc) - written_at).total_seconds()
             if age < 0 or age > config.SHARED_AUTH_MAX_AGE_S:
                 return None
-            cookies = payload.get("cookies")
-            if not isinstance(cookies, list) or not cookies:
+            # A valid payload has at least one of: cookies, local_storage,
+            # session_storage. HPCL uses localStorage for session tokens,
+            # so a cookies=[] payload is still useful if local_storage is
+            # populated. Reject only when ALL three are empty — that means
+            # the auth dump captured literally nothing and the transplant
+            # would be a no-op.
+            cookies = payload.get("cookies") or []
+            ls_data = payload.get("local_storage") or {}
+            ss_data = payload.get("session_storage") or {}
+            if not isinstance(cookies, list):
                 return None
+            if not isinstance(ls_data, dict):
+                ls_data = {}
+            if not isinstance(ss_data, dict):
+                ss_data = {}
+            if not cookies and not ls_data and not ss_data:
+                return None
+            # Normalize so callers can rely on the shape.
+            payload["cookies"] = cookies
+            payload["local_storage"] = ls_data
+            payload["session_storage"] = ss_data
             return payload
         except (ValueError, KeyError, TypeError, json.JSONDecodeError):
             return None
@@ -228,30 +307,94 @@ def read_shared_auth_state() -> dict | None:
 
 
 def inject_shared_auth_cookies(context: BrowserContext) -> int:
-    """Inject cookies from shared_auth.json into the given context if any
-    are available and fresh. Returns the number of cookies actually
-    injected (0 if the file is missing, stale, corrupt, or add_cookies
-    itself failed). Prints a visible INFO line on success so the operator
-    can confirm the cross-instance share is live."""
+    """Inject the full shared-auth state (cookies + localStorage +
+    sessionStorage) from shared_auth.json into the given context.
+
+    Returns the total number of surface items injected (cookies + ls keys
+    + ss keys). Returns 0 when the file is missing, stale, corrupt, or
+    every inject step itself failed.
+
+    Cookies are added directly via context.add_cookies() so they apply to
+    the next HTTP request. localStorage and sessionStorage cannot be
+    written before the page has a matching origin loaded, so we install
+    an add_init_script that runs before every page script on every future
+    navigation — when the next page.goto() or page.reload() lands on an
+    HPCL origin, the script seeds localStorage + sessionStorage from our
+    snapshot. The init-script approach survives reloads and redirects
+    without us having to re-inject manually.
+
+    Name kept as inject_shared_auth_cookies for backwards-compat with
+    start_browser/login_if_needed call sites even though it now also
+    injects storage surfaces — renaming would create a cross-file churn
+    for no behavioral gain."""
     shared = read_shared_auth_state()
     if not shared:
         return 0
-    cookies = shared["cookies"]
-    try:
-        context.add_cookies(cookies)
-    except Exception as e:
-        log.warning(
-            f"inject_shared_auth_cookies: add_cookies failed "
-            f"({type(e).__name__}: {e}); falling back to normal auth"
-        )
+    cookies = shared.get("cookies") or []
+    ls_data = shared.get("local_storage") or {}
+    ss_data = shared.get("session_storage") or {}
+    origin = shared.get("origin") or "https://hpchatbot.hpcl.co.in"
+
+    injected_cookies = 0
+    if cookies:
+        try:
+            context.add_cookies(cookies)
+            injected_cookies = len(cookies)
+        except Exception as e:
+            log.warning(
+                f"inject_shared_auth_cookies: add_cookies failed "
+                f"({type(e).__name__}: {e})"
+            )
+
+    injected_storage = 0
+    if ls_data or ss_data:
+        try:
+            # Build the init script once and install it on the context.
+            # The script runs before every page script on every future
+            # navigation, checks if the page is on HPCL's origin, and
+            # seeds localStorage + sessionStorage from our snapshot.
+            # Origin-gated so we don't pollute about:blank or other
+            # origins the browser may visit.
+            ls_json = json.dumps(ls_data)
+            ss_json = json.dumps(ss_data)
+            origin_json = json.dumps(origin)
+            init_script = (
+                "(() => {"
+                "  try {"
+                f"    const target = {origin_json};"
+                "    if (!window.location || !window.location.origin) return;"
+                "    if (window.location.origin !== target) return;"
+                f"    const ls = {ls_json};"
+                "    for (const k in ls) {"
+                "      try { localStorage.setItem(k, ls[k]); } catch (e) {}"
+                "    }"
+                f"    const ss = {ss_json};"
+                "    for (const k in ss) {"
+                "      try { sessionStorage.setItem(k, ss[k]); } catch (e) {}"
+                "    }"
+                "  } catch (e) {}"
+                "})();"
+            )
+            context.add_init_script(script=init_script)
+            injected_storage = len(ls_data) + len(ss_data)
+        except Exception as e:
+            log.warning(
+                f"inject_shared_auth_cookies: add_init_script failed "
+                f"({type(e).__name__}: {e})"
+            )
+
+    total = injected_cookies + injected_storage
+    if total == 0:
         return 0
     log.info(
-        f"injected {len(cookies)} shared HPCL cookie(s) from "
-        f"{config.SHARED_AUTH_FILENAME} "
-        f"(written_at={shared.get('written_at_utc')}) — "
-        f"attempting to skip operator auth this run"
+        f"injected shared auth from {config.SHARED_AUTH_FILENAME} "
+        f"(written_at={shared.get('written_at_utc')}): "
+        f"{injected_cookies} cookie(s), "
+        f"{len(ls_data)} localStorage key(s), "
+        f"{len(ss_data)} sessionStorage key(s) — "
+        f"next page load will pick up the transplanted session"
     )
-    return len(cookies)
+    return total
 
 
 def clear_auth_cooldown() -> None:
